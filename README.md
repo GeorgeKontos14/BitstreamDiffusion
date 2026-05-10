@@ -173,7 +173,7 @@ python -m scripts.lm1b.build_lm1b_bert_caches \
 
 A semantic-map step (`scripts.lm1b.prepare_lm1b_semantic_map`) is also provided for the semantic-bit ablations in the paper, but it is **not required** for the headline `raw_binary` results.
 
-**OpenWebText** — two stages: build the GPT-2 flat cache, then train (or download) the 16-bit code tokenizer, then materialize the second-stage cache. The bottleneck is OWT download itself.
+**OpenWebText** — two stages: build the GPT-2 flat cache, then download (recommended) or re-train the 16-bit code tokenizer, then materialize the second-stage cache.
 
 ```bash
 # (1) Build the GPT-2 flat token caches (train/val).
