@@ -268,16 +268,17 @@ Provided SLURM templates [`scripts/smoketest_lm1b.sh`](scripts/smoketest_lm1b.sh
 
 ## Training from scratch
 
-Both training configs implement the exact protocol described in Appendix B of the paper: 12-block / 768-d SDT trunk, AdamW (lr = 3 × 10⁻⁴, cosine decay, 2.5K warmup), batch size 512, BF16, EDM loss weighting, entropy-rate noise schedule with 40K-step warmup and 10K-step transition, self-conditioning probability 0.5 with carry-mode at sampling.
+Both training configs implement the exact protocol described in Appendix B of the paper: 12-block / 768-d SDT trunk, AdamW (lr = 3 × 10⁻⁴, cosine decay, 2.5K warmup), global batch size 512, BF16, EDM loss weighting, entropy-rate noise schedule with 40K-step warmup and 10K-step transition, self-conditioning probability 0.5 with carry-mode at sampling.
+
+The hardware below matches what we actually used to produce the released checkpoints. Other configurations (more or fewer GPUs) work identically as long as the per-step global batch size stays at 512 — the trainer divides the global batch evenly across the world size.
 
 ```bash
-# LM1B — 1,000,000 optimizer steps. ~1 week on 8 × H100.
-torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+# LM1B — 1,000,000 optimizer steps. ~2 days on 2 × NVIDIA GH200, global batch 512.
+torchrun --standalone --nnodes=1 --nproc_per_node=2 \
   train.py --config configs/lm1b/continuous/rate_bits_1M_edm_weight.py
 
-# OpenWebText — 750,000 steps reported in the paper; the config schedules 1M steps,
-# so you can stop at 750K and use that checkpoint for evaluation.
-torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+# OpenWebText — 750,000 steps (paper). ~6 days on 4 × NVIDIA GH200, global batch 512.
+torchrun --standalone --nnodes=1 --nproc_per_node=4 \
   train.py --config configs/owt/rate_bits_edm_weight.py
 ```
 
