@@ -277,7 +277,8 @@ The hardware below matches what we actually used to produce the released checkpo
 torchrun --standalone --nnodes=1 --nproc_per_node=2 \
   train.py --config configs/lm1b/continuous/rate_bits_1M_edm_weight.py
 
-# OpenWebText — 750,000 steps (paper). ~6 days on 4 × NVIDIA GH200, global batch 512.
+# OpenWebText — 1,000,000 optimizer steps. ~6 days on 4 × NVIDIA GH200, global batch 512.
+# Paper-reported numbers use the step=000750000.pt checkpoint; training continues to 1M.
 torchrun --standalone --nnodes=1 --nproc_per_node=4 \
   train.py --config configs/owt/rate_bits_edm_weight.py
 ```
