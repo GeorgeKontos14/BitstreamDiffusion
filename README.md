@@ -318,12 +318,15 @@ Each generation produces 1024 samples per spec. Generative perplexity is compute
 ## Citation
 
 ```bibtex
-@article{batzolis2026bitstream,
-  title  = {Towards Closing the Autoregressive Gap in Language Modeling
-            via Entropy-Gated Continuous Bitstream Diffusion},
-  author = {Batzolis, Georgios and Girolami, Mark and Ambrogioni, Luca},
-  journal= {arXiv preprint},
-  year   = {2026}
+@misc{batzolis2026bitstream,
+  title         = {Towards Closing the Autoregressive Gap in Language Modeling
+                   via Entropy-Gated Continuous Bitstream Diffusion},
+  author        = {Batzolis, Georgios and Girolami, Mark and Ambrogioni, Luca},
+  year          = {2026},
+  eprint        = {2605.07013},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
 }
 ```
 
