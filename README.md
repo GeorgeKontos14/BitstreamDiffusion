@@ -398,7 +398,6 @@ Each generation produces 1024 samples per spec. Generative perplexity is compute
   archivePrefix = {arXiv},
   primaryClass  = {cs.LG}
 }
-}
 ```
 
 ---
