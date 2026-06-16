@@ -1,8 +1,8 @@
-# Towards Closing the Autoregressive Gap in Language Modeling via Entropy-Gated Continuous Bitstream Diffusion
+# CoBit: Language Modeling with Bitstream Diffusion
 
 Official implementation of the paper:
 
-> **Towards Closing the Autoregressive Gap in Language Modeling via Entropy-Gated Continuous Bitstream Diffusion**
+> **CoBit: Language Modeling with Bitstream Diffusion**
 > Georgios Batzolis, Mark Girolami, Luca Ambrogioni
 > *arXiv preprint, 2026.* — [arXiv:2605.07013](https://arxiv.org/abs/2605.07013)
 
@@ -428,8 +428,7 @@ Each generation produces 1024 samples per spec. Generative perplexity is compute
 
 ```bibtex
 @misc{batzolis2026bitstream,
-  title         = {Towards Closing the Autoregressive Gap in Language Modeling
-                   via Entropy-Gated Continuous Bitstream Diffusion},
+  title         = {CoBit: Language Modeling with Bitstream Diffusion},
   author        = {Batzolis, Georgios and Girolami, Mark and Ambrogioni, Luca},
   year          = {2026},
   eprint        = {2605.07013},
