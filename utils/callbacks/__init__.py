@@ -13,6 +13,7 @@ from .vlb_bound import VLBBoundCallback
 from .external_ppl import ExternalPPLCallback
 from .mauve import MauveCallback
 from .visualization import VisualizationCallback
+from .textaudio_eval import TextAudioCallback
 
 # Optional extras (export only if you want them available)
 # from .entropy_schedule import EntropyScheduleCallback
@@ -28,4 +29,5 @@ __all__ = [
     "VLBBoundCallback",
     # "EntropyScheduleCallback",
     # "denoise_grid",
+    "TextAudioCallback"
 ]

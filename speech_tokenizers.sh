@@ -25,3 +25,7 @@ snapshot_download(
 )
 print('done')
 "
+
+pip install jiwer
+pip install git+https://github.com/Takaaki-Saeki/DiscreteSpeechMetrics.git --no-deps
+pip install pysptk pyworld fastdtw

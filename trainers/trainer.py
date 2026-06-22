@@ -35,7 +35,9 @@ from utils.callbacks import (
     ExternalPPLCallback,
     MauveCallback,
     VisualizationCallback,
+    TextAudioCallback
 )
+from utils.textaudio_utils import _sample_tasks_and_cond_masks
 
 
 from utils.schedule_controller import EntropyScheduleController
@@ -663,6 +665,26 @@ def _resolve_checkpointing_cfg(cfg) -> dict:
         "resume_interval_every_steps": resume_interval_every_steps,
     }
 
+
+def _load_text_speech_tokenizers(cfg, device):
+    import tiktoken
+    from stable_codec import StableCodec
+    text_tokenizer_name = str(getattr(cfg.data, 'text_tokenizer', 'o200k_base'))
+    speech_tokenizer_name = str(getattr(cfg.data, 'speech_tokenizer', 'stabilityai/stable-codec-speech-16k'))
+    speech_tokenizer_bottleneck = str(getattr(cfg.data, 'speech_tokenizer_bottleneck', '1x46656_400bps'))
+    speech_tokenizer_bottleneck_dims = getattr(cfg.data, 'speech_tokenize_bottleneck_dims', None)
+
+    text_tok = tiktoken.get_encoding(text_tokenizer_name)
+    speech_tok = StableCodec(pretrained_model=speech_tokenizer_name, device=device).eval()
+    if speech_tokenizer_bottleneck_dims is not None:
+        bottleneck_arg = [([speech_tokenizer_bottleneck_dims, 1.0])]
+    else:
+        bottleneck_arg = speech_tokenizer_bottleneck
+    speech_tok.set_posthoc_bottleneck(bottleneck_arg)
+
+    return text_tok, speech_tok
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Trainer
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1008,6 +1030,12 @@ class Trainer:
         self._entropy_ln_mu = None
         self._entropy_ln_std = None
 
+        dataset = self.cfg.data.dataset
+        if dataset == 'libri':
+            text_tok, speech_tok = _load_text_speech_tokenizers(cfg, self.device)
+            self.text_tok = text_tok
+            self.speech_tok = speech_tok
+
         self.callbacks: List[Callback] = []
 
         # ── framework-specific components ───────────────────────────────────
@@ -1073,6 +1101,12 @@ class Trainer:
             if vis_cfg is not None and bool(getattr(vis_cfg, "enabled", False)):
                 self.callbacks.append(VisualizationCallback(cfg))
 
+            gen_cfg = getattr(cfg.train, 'generation', None)
+            textaudio_cfg = getattr(cfg.train, 'textaudio', None)
+            if textaudio_cfg is not None and bool(getattr(textaudio_cfg, 'enabled', False)):
+                self.callbacks.append(TextAudioCallback(cfg))
+            # if gen_cfg is not None and bool(getattr(gen_cfg, "enabled", False)):
+            #     self.callbacks.append(GenerationCallback(self.sampler, cfg, False))
 
         elif cfg.framework == "discrete_sedd":
             self.proc = DiscreteForwardProcess(cfg)
@@ -1459,21 +1493,35 @@ class Trainer:
             prefix_mask = None
             cL_pos = None
         else:
-            cL_pos = _sample_cond_len_positions_per_example_continuous(
-                self.cfg, B, S, device=self.device
-            )
-            cond_enabled = bool((cL_pos.max().item() if B > 0 else 0) > 0)
-            prefix_mask = _make_prefix_mask_from_lengths(cL_pos, S) if cond_enabled else None
+            cond_text_audio = bool(getattr(cond_cfg, 'downstream', False))
+            if cond_text_audio:
+                bpt = int(getattr(self.cfg.data, 'bits_per_token', 18)) if not is_cont_tokens else 1
+                task_ids, prefix_mask = _sample_tasks_and_cond_masks(
+                    self.cfg, B, S, device=self.device, bits_per_token=bpt
+                )
+                cL_pos = None
+                cond_enabled = bool(prefix_mask.any().item())
+            else:
+                cL_pos = _sample_cond_len_positions_per_example_continuous(
+                    self.cfg, B, S, device=self.device
+                )
+                cond_enabled = bool((cL_pos.max().item() if B > 0 else 0) > 0)
+                prefix_mask = _make_prefix_mask_from_lengths(cL_pos, S) if cond_enabled else None
 
         noise_prefix = True
         suffix_only_loss = False
         p_uncond = 0.0
 
         if cond_enabled:
-            noise_prefix = bool(getattr(cond_cfg, "noise_prefix", False))
-            suffix_only_loss = bool(getattr(cond_cfg, "loss_on_suffix_only", True))
-            p_uncond = float(getattr(cond_cfg, "p_uncond", 0.0))
-            p_uncond = max(0.0, min(1.0, p_uncond))
+            if cond_text_audio:
+                noise_prefix = False
+                suffix_only_loss = True
+                p_uncond = 0.0
+            else:
+                noise_prefix = bool(getattr(cond_cfg, "noise_prefix", False))
+                suffix_only_loss = bool(getattr(cond_cfg, "loss_on_suffix_only", True))
+                p_uncond = float(getattr(cond_cfg, "p_uncond", 0.0))
+                p_uncond = max(0.0, min(1.0, p_uncond))
 
         # ------------------------------------------------------------------
         # Draw sigma

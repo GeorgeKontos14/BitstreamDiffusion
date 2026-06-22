@@ -12,6 +12,7 @@ import math
 
 import numpy as np
 import torch
+from torch.amp import autocast
 import torchaudio
 from datasets import load_dataset, Audio
 from tqdm import tqdm
@@ -106,9 +107,10 @@ def _tokenize_speaker_batch(
     Returns (B, seq_len) int64 on device. Always exactly seq_len tokens.
     """
     mel = bicodec.mel_transformer(wav_batch).squeeze(1)        # (B, n_mels, T_mel)
-    global_tokens = bicodec.speaker_encoder.tokenize(
-        mel.transpose(1, 2)                                     # (B, T_mel, n_mels)
-    )                                                           # (B, 1, seq_len)
+    with autocast('cuda', dtype=torch.float16):
+        global_tokens = bicodec.speaker_encoder.tokenize(
+            mel.transpose(1, 2)                                     # (B, T_mel, n_mels)
+        )                                                           # (B, 1, seq_len)
     tokens = global_tokens.squeeze(1)                           # (B, seq_len)
     assert tokens.shape[1] == seq_len, (
         f'BiCodec speaker encoder produced {tokens.shape[1]} tokens, expected {seq_len}'
@@ -142,8 +144,8 @@ def _tokenize_speech_batch(
     pad = (ds - T % ds) % ds
     if pad > 0:
         normed = torch.nn.functional.pad(normed, (0, pad))
-
-    _, tokens = stable_codec.encode(normed, posthoc_bottleneck=True)
+    with autocast('cuda', dtype=torch.float16):
+        _, tokens = stable_codec.encode(normed, posthoc_bottleneck=True)
     tokens = tokens[0]                                          # (B, S, 1) or (B, S)
     if tokens.dim() == 3:
         tokens = tokens.squeeze(-1)                             # (B, S)
@@ -163,7 +165,7 @@ def _tokenize_speech_batch(
 
 # ── duration filter ──────────────────────────────────────────────────────────
 
-def load_valid_ids(duration_file: str, max_duration: float) -> set[str]:
+def load_valid_ids(duration_file: str, max_duration: float, max_samples: int = -1) -> set[str]:
     """Return the set of sample IDs whose duration <= max_duration seconds.
 
     Expected CSV format (with or without a header row):
@@ -179,6 +181,8 @@ def load_valid_ids(duration_file: str, max_duration: float) -> set[str]:
             try:
                 if float(duration_str) <= max_duration:
                     valid.add(sample_id)
+                    if max_samples > 0 and len(valid) >= max_samples:
+                        break
             except ValueError:
                 pass  # skip header or malformed rows
     return valid
@@ -255,8 +259,9 @@ def build_packed_cache(
     force: bool,
     checkpoint_every: int = 50
 ) -> None:
-    pad_token   = SPEECH_OFFSET + speech_vocab
-    total_vocab = pad_token + 1
+    pad_token_text   = SPEECH_OFFSET + speech_vocab
+    pad_token_speech = pad_token_text+1
+    total_vocab = pad_token_speech + 1
 
     if cache_path.exists() and meta_path.exists() and not force:
         print(f'[libritts-cache] exists -> {cache_path}  (skip; pass --force to rebuild)')
@@ -316,7 +321,7 @@ def build_packed_cache(
 
     ds_ratio = stable_codec.model.downsampling_ratio
     loader = torch.utils.data.DataLoader(
-        CodecDataset(dataset, text_field),
+        CodecDataset(remaining, text_field),
         batch_size=batch_size,
         num_workers=num_workers,
         prefetch_factor=2 if num_workers > 0 else None,
@@ -338,9 +343,9 @@ def build_packed_cache(
         )):
             wav_batch = wav_batch.to(device, non_blocking=True)
 
-            text_tokens,    n_txt_trunc  = _tokenize_text_batch(text_tokenizer, texts, text_seq_len, pad_token)
+            text_tokens,    n_txt_trunc  = _tokenize_text_batch(text_tokenizer, texts, text_seq_len, pad_token_text)
             speaker_tokens               = _tokenize_speaker_batch(bicodec, wav_batch, speaker_seq_len)
-            speech_tokens,  n_sp_trunc   = _tokenize_speech_batch(stable_codec, wav_batch, true_wav_lengths, speech_seq_len, pad_token)
+            speech_tokens,  n_sp_trunc   = _tokenize_speech_batch(stable_codec, wav_batch, true_wav_lengths, speech_seq_len, pad_token_speech)
 
             n_text_truncated   += n_txt_trunc
             n_speech_truncated += n_sp_trunc
@@ -389,7 +394,8 @@ def build_packed_cache(
         'n_sequences': n_samples,
         'seq_len_tokens': seq_len,
         'total_vocab': total_vocab,
-        'pad_token': pad_token,
+        'pad_token_text': pad_token_text,
+        'pad_token_spech': pad_token_speech,
         'text_seq_len': text_seq_len,
         'text_offset': TEXT_OFFSET,
         'text_vocab': TEXT_VOCAB,
@@ -418,14 +424,16 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description='Build fixed-length multimodal token caches for LibriTTS.',
     )
-    # ── LibriTTS (train) ─────────────────────────────────────────────────
+    # ── LibriTTS (train/val) ─────────────────────────────────────────────────
     ap.add_argument('--hf_path',      type=str, default='mythicinfinity/libritts')
     ap.add_argument('--hf_config',    type=str, default='all')
     ap.add_argument('--train_split',  type=str,
                     default='train.clean.100+train.clean.360+train.other.500')
     ap.add_argument('--train_duration_file', type=str, default='durations/libri_train.csv',
                     help='CSV file (id, duration) for the training split.')
-
+    ap.add_argument('--val_split', type=str, default='dev.clean')
+    ap.add_argument('--val_duration_file', type=str, default='durations/libri_val.csv')
+    ap.add_argument('--val_size', type=int, default=512)
     # ── LibriSpeech (test) ───────────────────────────────────────────────
     ap.add_argument('--test_hf_path',   type=str,
                     default='mythicinfinity/librispeech-pc-44khz-opus')
@@ -438,7 +446,7 @@ def main() -> None:
     ap.add_argument('--test_other_duration_file', type=str, default='durations/libri_test_other.csv',
                     help='CSV file (id, duration) for test.other.')
 
-    ap.add_argument('--out_dir',      type=str, default='datasets/libritts')
+    ap.add_argument('--out_dir',      type=str, default='datasets/libri')
     ap.add_argument('--max_duration', type=float, default=32.0,
                     help='Drop samples longer than this many seconds (default: 32.0).')
 
@@ -459,7 +467,7 @@ def main() -> None:
                                '(e.g. 8 8 8 8 8 8 → speech_vocab=2^18=262144).')
     ap.add_argument('--speech_seq_len',    type=int, default=800)
 
-    ap.add_argument('--batch_size',  type=int, default=64)
+    ap.add_argument('--batch_size',  type=int, default=32)
     ap.add_argument('--num_workers', type=int, default=4,
                     help='DataLoader worker processes for parallel audio decoding.')
     ap.add_argument('--device',      type=str,
@@ -484,15 +492,16 @@ def main() -> None:
         speech_bottleneck_dims=args.speech_bottleneck_dims,
     )
 
-    def _load_ids(duration_file: str | None) -> set[str] | None:
+    def _load_ids(duration_file: str | None, max_samples: int = -1) -> set[str] | None:
         if duration_file is None:
             return None
-        ids = load_valid_ids(duration_file, args.max_duration)
+        ids = load_valid_ids(duration_file, args.max_duration, max_samples)
         print(f'[libritts-cache] {len(ids):,} IDs pass duration filter '
               f'(<= {args.max_duration}s) from {duration_file}')
         return ids
 
     train_valid_ids      = _load_ids(args.train_duration_file)
+    val_valid_ids        = _load_ids(args.val_duration_file, args.val_size)
     test_clean_valid_ids = _load_ids(args.test_clean_duration_file)
     test_other_valid_ids = _load_ids(args.test_other_duration_file)
 
@@ -524,6 +533,19 @@ def main() -> None:
         text_field='text_normalized',
         **shared,
     )
+
+    build_packed_cache(
+        hf_path=args.hf_path,
+        hf_config=args.hf_config,
+        hf_split=args.val_split,
+        split_name='val',
+        cache_path=out_dir / 'cache_libri_val.uint32',
+        meta_path=out_dir / 'cache_libri_val.meta.json',
+        valid_ids=val_valid_ids,
+        text_field='text_normalized',
+        **shared,
+    )
+
 
     build_packed_cache(
         hf_path=args.test_hf_path,
