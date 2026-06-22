@@ -93,7 +93,7 @@ class _ResolvedTextAudio:
     split: str
 
     num_samples: int
-    sampler: str
+    samplers: List[str]
     terminal_sigma: float
     num_steps: int
     entropic_blend_alpha: float
@@ -138,6 +138,19 @@ def _sanitize_sampler_name(x, default: str = "ddim_entropic") -> str:
             s = inner
 
     return s or default
+
+def _sanitize_sampler_list(x, default: str = "ddim_entropic") -> List[str]:
+    if x is None:
+        return [default]
+    if isinstance(x, (list, tuple)):
+        seen, result = set(), []
+        for item in x:
+            name = _sanitize_sampler_name(item, default)
+            if name not in seen:
+                seen.add(name)
+                result.append(name)
+        return result or [default]
+    return [_sanitize_sampler_name(x, default)]
 
 def _resolve_cfg(cfg: Any) -> _ResolvedTextAudio:
     train = getattr(cfg, 'train', None)
@@ -186,7 +199,7 @@ def _resolve_cfg(cfg: Any) -> _ResolvedTextAudio:
         raw_sampler = getattr(gen, "sampler", None)
         if raw_sampler is None:
             raw_sampler = getattr(gen, "samplers", None)
-    sampler = _sanitize_sampler_name(raw_sampler, default="ddim_entropic")
+    samplers = _sanitize_sampler_list(raw_sampler, default="ddim_entropic")
 
     terminal_sigma = getattr(c, "terminal_sigma", None) if c is not None else None
     if terminal_sigma is None and c is not None:
@@ -236,7 +249,7 @@ def _resolve_cfg(cfg: Any) -> _ResolvedTextAudio:
         run_on_sanity=run_on_sanity,
         split=split,
         num_samples=num_samples,
-        sampler=sampler,
+        samplers=samplers,
         terminal_sigma=terminal_sigma,
         num_steps=num_steps,
         entropic_blend_alpha=entropic_blend_alpha,
@@ -359,14 +372,41 @@ class TextAudioEvaluator:
         return metrics, transcriptions
     
 # -----------------------------------------------------------------------------
+# Config patch: disable stochastic churn for the deterministic DDIMSampler.
+# The stochastic variant reads evaluation.stochastic directly from the real cfg,
+# matching exactly how the OWT eval configs and GenerationCallback work.
+# -----------------------------------------------------------------------------
+
+class _DetCfgPatch:
+    """Wraps cfg so that cfg.evaluation.stochastic.enabled is always False."""
+    class _NoStoch:
+        enabled = False
+
+    class _DetEvalPatch:
+        def __init__(self, base_eval):
+            self._base = base_eval
+            self.stochastic = _DetCfgPatch._NoStoch()
+        def __getattr__(self, name):
+            return getattr(self._base, name)
+
+    def __init__(self, base_cfg):
+        self._base = base_cfg
+        self.evaluation = self._DetEvalPatch(getattr(base_cfg, "evaluation", object()))
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+
+# -----------------------------------------------------------------------------
 # Callback
 # -----------------------------------------------------------------------------
 class TextAudioCallback:
     run_on_all_ranks=True
-    
+
     def __init__(self, cfg: Any):
         self.cfg = cfg
         self._ddim_sampler = None
+        self._ddim_sampler_stoch = None
         self._evaluator = None
         self._last_run_key = None
 
@@ -404,26 +444,32 @@ class TextAudioCallback:
 
         return torch.cat(chunks, dim=0).contiguous()
     
-    def _get_sampler(self, trainer, r: _ResolvedTextAudio):
+    def _get_sampler(self, trainer, sampler_name: str):
         raw = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
-        if "ddim" in r.sampler:
-            if self._ddim_sampler is None:
-                from diffusion.continuous.samplers import DDIMSampler
-                self._ddim_sampler = DDIMSampler(
-                    raw, trainer.proc, self.cfg,
-                )
-            return self._ddim_sampler
+        if "ddim" in sampler_name:
+            from diffusion.continuous.samplers import DDIMSampler
+            if sampler_name.endswith('_stoch'):
+                # Stochastic: reads evaluation.stochastic from the real cfg as-is.
+                if self._ddim_sampler_stoch is None:
+                    self._ddim_sampler_stoch = DDIMSampler(raw, trainer.proc, self.cfg)
+                return self._ddim_sampler_stoch
+            else:
+                # Deterministic: patch cfg to keep stochastic churn disabled.
+                if self._ddim_sampler is None:
+                    self._ddim_sampler = DDIMSampler(raw, trainer.proc, _DetCfgPatch(self.cfg))
+                return self._ddim_sampler
         return trainer.sampler
 
     def _generate_task(
-        self, trainer, x_full: torch.Tensor, task_id: int, B: int, r: _ResolvedTextAudio
+        self, trainer, x_full: torch.Tensor, task_id: int, B: int, r: _ResolvedTextAudio,
+        sampler_name: str,
     ) -> torch.Tensor:
         cond_mask = _fixed_mask(
             self.cfg, B, r.sequence_len, task_id, device=trainer.device, bits_per_token=r.bits_per_token
         )
-        schedule = 'entropic' if 'entropic' in r.sampler else 'karras'
-        sampler_obj = self._get_sampler(trainer, r)
-        
+        schedule = 'entropic' if 'entropic' in sampler_name else 'karras'
+        sampler_obj = self._get_sampler(trainer, sampler_name)
+
         entropy_run_dir = r.entropy_run_dir
         if entropy_run_dir is None:
             entropy_run_dir = str(getattr(trainer, 'run_dir', '.'))
@@ -600,7 +646,7 @@ class TextAudioCallback:
                 _dbg(f'W&B table log failed {e}')
 
     def _save_to_disk(
-        self, trainer, all_results: Dict[str, dict], r: _ResolvedTextAudio, step: int, epoch: int
+        self, trainer, all_results: Dict[str, Dict[str, dict]], r: _ResolvedTextAudio, step: int, epoch: int
     ) -> None:
         run_dir = Path(str(getattr(trainer, 'run_dir', 'runs/default')))
         base_dir = run_dir / 'textaudio'
@@ -636,64 +682,72 @@ class TextAudioCallback:
                 'step': step,
                 'epoch': epoch,
                 'num_samples': r.num_samples,
-                'sampler': {
-                    'name': r.sampler,
-                    'num_steps': r.num_steps,
-                    'terminal_sigma': r.terminal_sigma,
-                },
+                'samplers': [
+                    {
+                        'name': s,
+                        'num_steps': r.num_steps,
+                        'terminal_sigma': r.terminal_sigma,
+                    }
+                    for s in r.samplers
+                ],
                 'sample_rate': r.sample_rate,
             },
-            'tasks': {},
+            'samplers': {},
         }
 
-        for task, res in all_results.items():
-            task_dir = save_dir / task
-            task_dir.mkdir(exist_ok=True)
+        for sampler_name, task_results in all_results.items():
+            sampler_entry: Dict[str, dict] = {'tasks': {}}
 
-            gen_texts = res.get('gen_texts', [])
-            ref_texts = res.get('ref_texts', [])
-            gen_wavs = res.get('gen_wavs', [])
-            ref_wavs = res.get('ref_wavs')
-            transcriptions = res.get('transcriptions')
-            metrics = res.get('metrics', {})
+            for task, res in task_results.items():
+                task_dir = save_dir / sampler_name / task
+                task_dir.mkdir(parents=True, exist_ok=True)
 
-            samples = []
-            n = r.num_samples
+                gen_texts = res.get('gen_texts', [])
+                ref_texts = res.get('ref_texts', [])
+                gen_wavs = res.get('gen_wavs', [])
+                ref_wavs = res.get('ref_wavs')
+                transcriptions = res.get('transcriptions')
+                metrics = res.get('metrics', {})
 
-            for i in range(n):
-                sample = {'idx': i}
+                samples = []
+                n = r.num_samples
 
-                if task in ('joint', 'stt', 'cont'):
-                    sample['gen_text'] = gen_texts[i]
-                if task in ('tts', 'stt'):
-                    sample['ref_text'] = ref_texts[i]
+                for i in range(n):
+                    sample = {'idx': i}
 
-                if task in ('joint', 'tts', 'cont'):
-                    wav_rel = f'{task}/gen_{i:04d}.wav'
-                    _write_wav(save_dir / wav_rel, gen_wavs[i], r.sample_rate)
-                    sample['gen_wav'] = wav_rel
-                
-                if task in ('tts', 'stt'):
-                    wav_rel = f'{task}/ref_{i:04d}.wav'
-                    _write_wav(save_dir / wav_rel, ref_wavs[i], r.sample_rate)
-                    sample['ref_wav'] = wav_rel
+                    if task in ('joint', 'stt', 'cont'):
+                        sample['gen_text'] = gen_texts[i]
+                    if task in ('tts', 'stt'):
+                        sample['ref_text'] = ref_texts[i]
 
-                if task in ('joint', 'tts'):
-                    sample['whisper'] = transcriptions[i]
+                    if task in ('joint', 'tts', 'cont'):
+                        wav_rel = f'{sampler_name}/{task}/gen_{i:04d}.wav'
+                        _write_wav(save_dir / wav_rel, gen_wavs[i], r.sample_rate)
+                        sample['gen_wav'] = wav_rel
 
-                samples.append(sample)
+                    if task in ('tts', 'stt'):
+                        wav_rel = f'{sampler_name}/{task}/ref_{i:04d}.wav'
+                        _write_wav(save_dir / wav_rel, ref_wavs[i], r.sample_rate)
+                        sample['ref_wav'] = wav_rel
 
-            clean_metrics = {}
-            for k, v in metrics.items():
-                if isinstance(v, float) and math.isnan(v):
-                    clean_metrics[k] = None
-                else:
-                    clean_metrics[k] = v
+                    if task in ('joint', 'tts'):
+                        sample['whisper'] = transcriptions[i]
 
-            report_data['tasks'][task] = {
-                'metrics': clean_metrics,
-                'samples': samples
-            }
+                    samples.append(sample)
+
+                clean_metrics = {}
+                for k, v in metrics.items():
+                    if isinstance(v, float) and math.isnan(v):
+                        clean_metrics[k] = None
+                    else:
+                        clean_metrics[k] = v
+
+                sampler_entry['tasks'][task] = {
+                    'metrics': clean_metrics,
+                    'samples': samples,
+                }
+
+            report_data['samplers'][sampler_name] = sampler_entry
 
         with open(save_dir / 'data.json', 'w', encoding='utf-8') as f:
             json.dump(report_data, f, indent=4, ensure_ascii=False)
@@ -740,25 +794,28 @@ class TextAudioCallback:
                 if _rank0():
                     _dbg(
                         f"START epoch={epoch} split={r.split} "
-                        f"B={B} steps={r.num_steps} sampler={r.sampler} "
+                        f"B={B} steps={r.num_steps} samplers={r.samplers} "
                         f"sigma={r.terminal_sigma}"
                     )
 
                 amp_dtype = getattr(trainer, "amp_dtype", torch.float16)
-                task_bits = {}
+                sampler_task_bits: Dict[str, Dict[str, torch.Tensor]] = {}
 
                 with autocast(enabled=r.use_amp, dtype=amp_dtype):
-                    for task_id, task in enumerate(TASKS):
-                        if _rank0():
-                            _dbg(f"  {r.split}_{task}: generating {B} samples")
-                        try:
-                            bits = self._generate_task(trainer, x_full, task_id, B, r)
-                            task_bits[task] = bits
-                        except Exception as e:
+                    for sampler_name in r.samplers:
+                        task_bits: Dict[str, torch.Tensor] = {}
+                        for task_id, task in enumerate(TASKS):
                             if _rank0():
-                                _dbg(f"  {r.split}_{task}: generation failed: {e}")
+                                _dbg(f"  {r.split}_{task} [{sampler_name}]: generating {B} samples")
+                            try:
+                                bits = self._generate_task(trainer, x_full, task_id, B, r, sampler_name)
+                                task_bits[task] = bits
+                            except Exception as e:
+                                if _rank0():
+                                    _dbg(f"  {r.split}_{task} [{sampler_name}]: generation failed: {e}")
+                        sampler_task_bits[sampler_name] = task_bits
             else:
-                task_bits = {}
+                sampler_task_bits = {}
                 if _rank0():
                     _dbg(f"No data from {r.split} split")
 
@@ -770,50 +827,55 @@ class TextAudioCallback:
         if not _rank0():
             return
 
-        if has_data and task_bits:
+        if has_data and sampler_task_bits:
             step = _global_step(trainer, epoch)
             self._ensure_evaluator(r)
-            all_results = {}
+            all_results: Dict[str, Dict[str, dict]] = {}  # {sampler_name: {task: result}}
 
-            for task, bits in task_bits.items():
-                _dbg(f"  {r.split}_{task}: decoding+evaluating")
-                try:
-                    needs_gen_text = task in ("joint", "stt", "cont")
-                    needs_gen_wav  = task in ("joint", "tts", "cont")
-                    needs_ref      = task in ("tts", "stt")
+            for sampler_name, task_bits in sampler_task_bits.items():
+                sampler_results: Dict[str, dict] = {}
 
-                    token_ids  = self._bits_to_token_ids(bits, r)
-                    gen_texts  = self._decode_texts(trainer, token_ids, r) if needs_gen_text else []
-                    gen_wavs   = self._decode_speech_wavs(trainer, token_ids, r) if needs_gen_wav else []
+                for task, bits in task_bits.items():
+                    _dbg(f"  {r.split}_{task} [{sampler_name}]: decoding+evaluating")
+                    try:
+                        needs_gen_text = task in ("joint", "stt", "cont")
+                        needs_gen_wav  = task in ("joint", "tts", "cont")
+                        needs_ref      = task in ("tts", "stt")
 
-                    ref_texts = []
-                    ref_wavs  = None
-                    if needs_ref:
-                        ref_token_ids = self._bits_to_token_ids(
-                            (x_full > 0.5).to(torch.long), r,
+                        token_ids  = self._bits_to_token_ids(bits, r)
+                        gen_texts  = self._decode_texts(trainer, token_ids, r) if needs_gen_text else []
+                        gen_wavs   = self._decode_speech_wavs(trainer, token_ids, r) if needs_gen_wav else []
+
+                        ref_texts = []
+                        ref_wavs  = None
+                        if needs_ref:
+                            ref_token_ids = self._bits_to_token_ids(
+                                (x_full > 0.5).to(torch.long), r,
+                            )
+                            ref_texts = self._decode_texts(trainer, ref_token_ids, r)
+                            ref_wavs  = self._decode_speech_wavs(trainer, ref_token_ids, r)
+
+                        metrics, transcriptions = self._evaluator.evaluate_task(
+                            task, gen_texts, ref_texts, gen_wavs, trainer.device,
                         )
-                        ref_texts = self._decode_texts(trainer, ref_token_ids, r)
-                        ref_wavs  = self._decode_speech_wavs(trainer, ref_token_ids, r)
+                    except Exception as e:
+                        _dbg(f"  {r.split}_{task} [{sampler_name}]: eval failed: {e}")
+                        continue
 
-                    metrics, transcriptions = self._evaluator.evaluate_task(
-                        task, gen_texts, ref_texts, gen_wavs, trainer.device,
+                    sampler_results[task] = {
+                        "metrics": metrics, "gen_texts": gen_texts,
+                        "ref_texts": ref_texts, "gen_wavs": gen_wavs,
+                        "ref_wavs": ref_wavs, "transcriptions": transcriptions,
+                    }
+
+                    tag = f"{r.split}_{task}/{sampler_name}"
+                    self._log_scalars(trainer, metrics, tag, step)
+                    self._log_samples(
+                        trainer, task, tag, step,
+                        gen_texts, ref_texts, gen_wavs, ref_wavs, transcriptions, r,
                     )
-                except Exception as e:
-                    _dbg(f"  {r.split}_{task}: eval failed: {e}")
-                    continue
 
-                all_results[task] = {
-                    "metrics": metrics, "gen_texts": gen_texts,
-                    "ref_texts": ref_texts, "gen_wavs": gen_wavs,
-                    "ref_wavs": ref_wavs, "transcriptions": transcriptions,
-                }
-
-                tag = f"{r.split}_{task}"
-                self._log_scalars(trainer, metrics, tag, step)
-                self._log_samples(
-                    trainer, task, tag, step,
-                    gen_texts, ref_texts, gen_wavs, ref_wavs, transcriptions, r,
-                )
+                all_results[sampler_name] = sampler_results
 
             if all_results:
                 try:

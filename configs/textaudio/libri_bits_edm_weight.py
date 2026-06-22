@@ -172,13 +172,13 @@ def get_config():
     cfg.train.checkpointing.resume_interval.every_steps = 5_000
 
     cfg.train.sanity = config_dict.ConfigDict()
-    cfg.train.sanity.enabled = True
+    cfg.train.sanity.enabled = False
     cfg.train.sanity.run_epoch = -1
 
     cfg.train.generation = config_dict.ConfigDict()
-    cfg.train.generation.enabled = False
+    cfg.train.generation.enabled = True
     cfg.train.generation.splits = ["val"]
-    cfg.train.generation.every_epochs = 5
+    cfg.train.generation.every_epochs = 4
     cfg.train.generation.num_samples = 64
     cfg.train.generation.num_sampling_steps = 128
     cfg.train.generation.samplers = ["ddim_entropic"]
@@ -195,7 +195,9 @@ def get_config():
     cfg.train.textaudio.run_on_sanity = True
     cfg.train.textaudio.every_epochs = 10
     cfg.train.textaudio.split = 'val'
-    cfg.train.textaudio.num_samples = 64
+    cfg.train.textaudio.num_samples = 128
+    cfg.train.textaudio.num_steps = 256
+    cfg.train.textaudio.samplers = ['ddim_entropic', 'ddim_entropic_stoch']
     cfg.train.textaudio.whisper_model = 'openai/whisper-medium'
 
 
@@ -237,6 +239,12 @@ def get_config():
     cfg.evaluation.ati = config_dict.ConfigDict()
     cfg.evaluation.ati.enabled = False
     cfg.evaluation.ati.eta = 0.0
+
+    cfg.evaluation.stochastic = config_dict.ConfigDict()
+    cfg.evaluation.stochastic.enabled = True
+    cfg.evaluation.stochastic.s_churn = 33.15
+    cfg.evaluation.stochastic.s_noise = 1.003
+    cfg.evaluation.stochastic.window_mode = 'full'
 
     cfg.evaluation.sampling_sweep = config_dict.ConfigDict()
     cfg.evaluation.sampling_sweep.enabled = True
