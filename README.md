@@ -55,6 +55,7 @@ BitstreamDiffusion/
 └── scripts/
     ├── lm1b/                      # LM1B download + cache + semantic map
     ├── owt/                       # OWT codec training + cache prebuild
+    ├── textaudio/                 # MLS download + cache for text-audio multimodal experiments
     ├── profile_*.py               # efficiency benchmarks (Table 2)
     ├── smoketest_lm1b.sh          # one-seed reproducibility check (SLURM)
     └── smoketest_owt.sh
@@ -78,6 +79,8 @@ conda activate bitstream
 # PyTorch — pick the build matching your CUDA toolkit
 # (replace cu121 with your CUDA version; see https://pytorch.org/get-started)
 python -m pip install torch==2.4.* --index-url https://download.pytorch.org/whl/cu121
+# For text-audio experiments:
+python -m pip install torchaudio==2.4.* --index-url https://download.pytorch.org/whl/cu121
 
 # Project dependencies
 python -m pip install -r requirements.txt
@@ -103,6 +106,10 @@ separately:
 python -m pip install pytorch-fid
 ```
 
+For text-audio experiments, download the additional requirements (Note: `flash_attn` is also mandatory in this case, because it is used by the speech tokenizer. It must be downloaded before this):
+```bash
+./textaudio_install.sh
+```
 ---
 
 ## Quick start: reproducing the paper

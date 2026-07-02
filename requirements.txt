@@ -17,8 +17,18 @@ tokenizers>=0.19
 datasets>=2.18
 accelerate>=0.30
 
+# Text tokenizer for the LibriTTS packed-cache pipeline (o200k_base encoding)
+tiktoken==0.13.0
+
+# Audio I/O and feature extraction (used by the speech duration/codec pipeline)
+librosa>=0.10
+soundfile>=0.12
+
 # Logging / TensorBoard
 tensorboard>=2.15
+
+# Experiment tracking (used for the speech training runs)
+wandb>=0.16
 
 # Evaluation: MAUVE metric
 mauve-text>=0.4.0
@@ -39,9 +49,3 @@ gdown>=5.1
 gensim>=4.3
 # tensorflow-datasets>=4.9   # uncomment if using --backend tfds for LM1B download
 
-# Optional: faster attention kernel
-# (install separately so users on incompatible hardware can skip it)
-# flash-attn>=2.5
-
-# Optional: experiment tracking
-# wandb>=0.16
