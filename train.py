@@ -41,6 +41,8 @@ def _update_cfg_from_dict(cfg, d, skip_sections=("logging", "system", "evaluatio
             if not hasattr(cfg, k) or getattr(cfg, k) is None:
                 setattr(cfg, k, config_dict.ConfigDict())
             _update_cfg_from_dict(getattr(cfg, k), v, skip_sections=skip_sections)
+        elif isinstance(v, list):
+            setattr(cfg, k, [config_dict.ConfigDict(x) if isinstance(x, dict) else x for x in v])
         else:
             setattr(cfg, k, v)
 

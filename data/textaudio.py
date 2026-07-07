@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from ml_collections import config_dict
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 
@@ -23,7 +23,7 @@ def _ceil_log2(x: int) -> int:
 def _load_memmap(cache_path: Path, meta_path: Path) -> tuple[np.memmap, dict]:
     if not cache_path.exists() or not meta_path.exists():
         raise RuntimeError(
-            "Missing LM1B token cache files. Run scripts/build_lm1b_bert_caches.py first.\n"
+            "Missing Textaudio token cache files. Run scripts/textaudio//build_textaudio_caches.py first.\n"
             f"Expected: {cache_path} and {meta_path}"
         )
 
@@ -48,14 +48,19 @@ def _ddp_rank_world() -> tuple[int, int]:
         return 0,1
     return int(dist.get_rank()), int(dist.get_world_size())
 
-class TextAudioDataset(Dataset):
-    def __init__(self, config: config_dict.ConfigDict, *, split: str):
+class _PackedTokenCacheDataset(Dataset):
+    def __init__(
+        self,
+        config: config_dict.ConfigDict,
+        *,
+        cache_path: Path,
+        meta_path: Path,
+        expected_cache_format: str,
+        expected_seq_len_tokens: Optional[int] = None,
+        log_tag: str = "textaudio",
+    ):
         super().__init__()
-        assert split in {'train', 'val', 'test'}
         self.config = config
-        self.split = split
-
-        self.root = Path(getattr(config.data, 'root', 'datasets/libri'))
 
         self.repr = str(getattr(config.data, 'representation', 'binary')).lower().strip()
         self.binarization = str(getattr(config.data, 'binarization', 'raw_binary')).lower().strip()
@@ -64,7 +69,7 @@ class TextAudioDataset(Dataset):
         if self.repr == "binary":
             if self.binarization not in {"semantic", "raw_binary"}:
                 raise ValueError(
-                    f"Unknown cfg.data.binarization={self.binarization!r} for LM1B binary mode. "
+                    f"Unknown cfg.data.binarization={self.binarization!r} for Text-audio binary mode. "
                     "Supported: 'semantic', 'raw_binary'."
                 )
         elif self.repr == "tokens":
@@ -78,16 +83,16 @@ class TextAudioDataset(Dataset):
             }:
                 raise ValueError(f"Unknown cfg.data.token_space={self.token_space}")
         else:
-            raise ValueError(f"Unsupported LM1B representation={self.repr}")
+            raise ValueError(f"Unsupported Text-Audio representation={self.repr}")
 
         self.vocab_size_base = int(getattr(config.data, 'vocab_size_base', 250773))
         self.pad_token_text_id = self.vocab_size_base-2
         self.pad_token_speech_id = self.vocab_size_base-1
         self.unk_token_id = None
-        
+
         self.ecc = ecc_from_cfg(config)
         self.ecc_enabled = bool(self.ecc.enabled)
-    
+
         data_bits_default = _ceil_log2(self.vocab_size_base)
         data_bits_cfg = getattr(config.data, "bits_per_token", None)
         self.data_bits_per_token = int(data_bits_cfg) if data_bits_cfg is not None else int(data_bits_default)
@@ -95,7 +100,7 @@ class TextAudioDataset(Dataset):
         min_bits_needed = _ceil_log2(self.vocab_size_base)
         if self.data_bits_per_token < min_bits_needed:
             raise ValueError(
-                f"LM1B requires at least {min_bits_needed} data bits to encode vocab_size={self.vocab_size_base}, "
+                f"Text-audio data requires at least {min_bits_needed} data bits to encode vocab_size={self.vocab_size_base}, "
                 f"but cfg.data.bits_per_token={self.data_bits_per_token}."
             )
 
@@ -108,59 +113,42 @@ class TextAudioDataset(Dataset):
             self.bits_per_token = int(ecc_chunk_len(self.ecc))
         else:
             self.bits_per_token = int(self.data_bits_per_token)
-        
+
         if self.repr == 'binary':
             self.token_to_bits_table = _build_token_to_bits_table(
                 self.vocab_size_base, self.bits_per_token
             )
 
-        self.seq_len_tokens = int(getattr(config.data, 'seq_len_tokens', 1000))
-        self.seq_len_bits = self.seq_len_tokens*self.bits_per_token
-
-        if split == 'train':
-            mm, meta = _load_memmap(
-                self.root / 'cache_libri_train.uint32',
-                self.root / 'cache_libri_train.meta.json'
-            )
-        elif split == 'val':
-            mm, meta = _load_memmap(
-                self.root / 'cache_libri_val.uint32',
-                self.root / 'cache_libri_val.meta.json'
-            )
-        else:
-            test_partition = str(getattr(config.data, 'partition', 'clean'))
-            mm, meta = _load_memmap(
-                self.root / f'cache_libri_test_{test_partition}.uint32',
-                self.root / f'cache_libri_test_{test_partition}.meta.json'
-            )
-
+        mm, meta = _load_memmap(cache_path, meta_path)
         self.mm = mm
-        expected_cache_format = 'packed_multimodal_blocks'
+
         cache_format = str(meta.get("cache_format", "legacy_unknown"))
         if cache_format != expected_cache_format:
             raise RuntimeError(
-                "Libri cache files are not in the required packed-block format.\n"
-                "Delete the old cache_*.uint32 / cache_*.meta.json files and rebuild them with:\n"
-                "python -m scripts.build_libritts_caches.py --force"
-            ) 
-        if int(meta["seq_len_tokens"]) != self.seq_len_tokens:
-            raise RuntimeError(
-                f"Cache seq_len={meta['seq_len_tokens']} but config expects {self.seq_len_tokens}."
+                f"{cache_path} has cache_format={cache_format!r}, expected {expected_cache_format!r}.\n"
+                f"Delete it and rebuild with the matching scripts/textaudio/build_*.py script."
             )
-
         self.cache_format = expected_cache_format
 
-        self.start = 0        
+        self.seq_len_tokens = int(meta["seq_len_tokens"])
+        if expected_seq_len_tokens is not None and self.seq_len_tokens != int(expected_seq_len_tokens):
+            raise RuntimeError(
+                f"{cache_path} seq_len_tokens={self.seq_len_tokens} but config expects "
+                f"{expected_seq_len_tokens}."
+            )
+        self.seq_len_bits = self.seq_len_tokens*self.bits_per_token
+
+        self.start = 0
         self.end = int(self.mm.shape[0])
         self.num_sequences = int(self.end-self.start)
-    
+
         print(
-            f"[lm1b] split={split} cache_format={self.cache_format} "
+            f"[{log_tag}] cache={cache_path} cache_format={self.cache_format} "
             f"repr={self.repr} "
             f"{'binarization=' + self.binarization if self.repr == 'binary' else 'token_space=' + self.token_space} "
             f"vocab_base={self.vocab_size_base} seq_tokens={self.seq_len_tokens} "
             f"bits/token={self.bits_per_token} num_seq={self.num_sequences} "
-        )    
+        )
 
     def __len__(self) -> int:
         return self.num_sequences
@@ -172,18 +160,124 @@ class TextAudioDataset(Dataset):
         return bits.view(-1)
 
 
+class TextAudioDataset(_PackedTokenCacheDataset):
+    TASK = 'asr'
+
+    def __init__(self, config: config_dict.ConfigDict, *, split: str):
+        assert split in {'train', 'val', 'test'}
+        self.split = split
+        root = Path(getattr(config.data, 'root', 'datasets/'))
+
+        if split == 'train':
+            cache_path = root / 'libri' / 'cache_libri_train.uint32'
+            meta_path = root / 'libri' / 'cache_libri_train.meta.json'
+        elif split == 'val':
+            stem = f'validation/cache_val_{self.TASK}'
+            cache_path = root / f'{stem}.uint32'
+            meta_path = root / f'{stem}.meta.json'
+        else:
+            test_partition = str(getattr(config.data, 'partition', 'clean'))
+            stem = f'test/cache_test_{test_partition}_{self.TASK}'
+            cache_path = root / f'{stem}.uint32'
+            meta_path = root / f'{stem}.meta.json'
+
+        log_tag = 'asr' if split == 'val' else 'textaudio' 
+
+        super().__init__(
+            config,
+            cache_path=cache_path,
+            meta_path=meta_path,
+            expected_cache_format='packed_multimodal_blocks',
+            expected_seq_len_tokens=int(getattr(config.data, 'seq_len_tokens', 1000)),
+            log_tag=log_tag,
+        )
+
+
+class MLSTextAudioDataset(_PackedTokenCacheDataset):
+    """Additional English-MLS training data for large-scale runs -- merged
+    into the training set via ConcatDataset (see get_dataloaders). Only a
+    'train' split exists; MLS isn't used for val/test."""
+
+    def __init__(self, config: config_dict.ConfigDict, *, split: str):
+        if split != 'train':
+            raise ValueError(
+                f"MLSTextAudioDataset has no split={split!r}; only 'train' exists."
+            )
+        root = Path(getattr(config.data, 'root', 'datasets/'))
+        stem = 'mls/cache_mls_train'
+
+        super().__init__(
+            config,
+            cache_path=root / f'{stem}.uint32',
+            meta_path=root / f'{stem}.meta.json',
+            expected_cache_format='packed_multimodal_blocks',
+            expected_seq_len_tokens=int(getattr(config.data, 'seq_len_tokens', 1000)),
+            log_tag='mls',
+        )
+        self.split = split
+
+
+class TextAudioTTSDataset(_PackedTokenCacheDataset):
+    TASK = 'tts'
+
+    def __init__(self, config: config_dict.ConfigDict, *, split: str):
+        if split != 'val':
+            raise ValueError(
+                f"TextAudioTTSDataset has no split={split!r}; only 'val' exists."
+            )
+        root = Path(getattr(config.data, 'root', 'datasets/'))
+        stem = f'validation/cache_val_{self.TASK}'
+
+        text_seq_len = int(getattr(config.data, 'text_seq_len', 168))
+        speaker_seq_len = int(getattr(config.data, 'speaker_seq_len', 32))
+
+        super().__init__(
+            config,
+            cache_path=root / f'{stem}.uint32',
+            meta_path=root / f'{stem}.meta.json',
+            expected_cache_format='packed_tts_blocks',
+            expected_seq_len_tokens=text_seq_len + speaker_seq_len,
+            log_tag='tts',
+        )
+        self.split = split
+
+
+class TextAudioContinuationDataset(_PackedTokenCacheDataset):
+    TASK = 'cont'
+
+    def __init__(self, config: config_dict.ConfigDict, *, split: str):
+        if split != 'val':
+            raise ValueError(
+                f"TextAudioContinuationDataset has no split={split!r}; only 'val' exists."
+            )
+        root = Path(getattr(config.data, 'root', 'datasets/'))
+        stem = f'validation/cache_val_{self.TASK}'
+
+        super().__init__(
+            config,
+            cache_path=root / f'{stem}.uint32',
+            meta_path=root / f'{stem}.meta.json',
+            expected_cache_format='packed_continuation_prefix_blocks',
+            expected_seq_len_tokens=None,
+            log_tag='cont',
+        )
+        self.split = split
+
+
 def get_dataloaders(
     config: config_dict.ConfigDict,
     *,
     batch_size: Optional[int] = None,
     seed: int = 42
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    if str(config.data.dataset) != 'libri':
-        raise NotImplementedError('config.data.dataset must be data/libritts')
+    if str(config.data.dataset) != 'textaudio':
+        raise NotImplementedError('config.data.dataset must be textaudio')
 
     batch = int(batch_size or config.train.batch_size)
 
     train_ds = TextAudioDataset(config, split='train')
+    if bool(getattr(config.data, 'use_mls_train', False)):
+        train_ds = ConcatDataset([train_ds, MLSTextAudioDataset(config, split='train')])
     val_ds = TextAudioDataset(config, split='val')
     test_ds = TextAudioDataset(config, split='test')
 

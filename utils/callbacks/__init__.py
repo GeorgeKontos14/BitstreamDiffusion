@@ -13,7 +13,7 @@ from .vlb_bound import VLBBoundCallback
 from .external_ppl import ExternalPPLCallback
 from .mauve import MauveCallback
 from .visualization import VisualizationCallback
-from .textaudio_eval import TextAudioCallback
+from .textaudio_generation import TextAudioCallback
 
 # Optional extras (export only if you want them available)
 # from .entropy_schedule import EntropyScheduleCallback

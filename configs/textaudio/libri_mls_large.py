@@ -1,18 +1,37 @@
+# configs/textaudio/libri_mls_large.py
+#
+# MAIN scaled run: joint audio+text bitstream diffusion on LibriTTS+MLS (~11M pairs),
+# StableCodec speech tokens ("1x46656_400bps"), BiCodec speaker tokens, SDT large 26x1152 (~633M),
+# trained to 2M steps. The "serious, competitive, scaled" setup and the reference
+
+#
+# Geometry: [SOS][SOT] text(168) [EOT][SOSpk] speaker(32) [EOSpk][SOSpc] speech(800) [EOSpc]
+#   = 1000 positions * 18 bits = 18000 bits. (truncates only 53 samples from LibriTTS; maintains full MLS)
+
+
+# Trainer: 16 GH200 / 4 nodes, global batch 512 (32/GPU), multi-node launcher
+#   train_textaudio_joint_hpc.sh. Cosine total_steps=2M so the LR
+#   decays across the whole horizon and any checkpoint is usable (stop-anytime).
+
+import os
 from ml_collections import config_dict
+
 
 def get_config():
     cfg = config_dict.ConfigDict()
-    
-    cfg.framework = 'continuous_score'
-    cfg.experiment = 'textaudio_pilot'
-    cfg.device = 'cuda'
+
+    cfg.framework = "continuous_score"
+    cfg.experiment = "full_textaudio"
+    cfg.device = "cuda"
 
     # ------------------------------------------------------------------
-    # Data
+    # Data -- shared 18-bit multimodal bits
     # ------------------------------------------------------------------
+
     cfg.data = config_dict.ConfigDict()
-    cfg.data.dataset = 'libri'
-    cfg.data.root = 'datasets/libri'
+    cfg.data.dataset = 'textaudio'
+    cfg.data.root = 'datasets/'
+    cfg.data.use_mls_train = True
     cfg.data.text_tokenizer = 'o200k_base'
     cfg.data.speech_tokenizer = 'stabilityai/stable-codec-speech-16k'
     cfg.data.speech_tokenizer_bottleneck = '1x46656_400bps'
@@ -39,14 +58,12 @@ def get_config():
     cfg.data.channels = 1
     cfg.data.flatten_order = 'flatten'
 
-    cfg.data.num_workers = 12
+    cfg.data.num_workers = 8
     cfg.data.prefetch_factor = 4
     cfg.data.pin_memory = True
-    
-    cfg.data.partition = 'clean' # Test-only
 
     # ------------------------------------------------------------------
-    # Unconditional benchmark setting
+    # Conditioning -- random per-modality masking
     # ------------------------------------------------------------------
     cfg.cond = config_dict.ConfigDict()
     cfg.cond.enabled = True
@@ -58,19 +75,21 @@ def get_config():
     cfg.cond.downstream = True
 
     # ------------------------------------------------------------------
-    # Model
+    # Model -- LARGE 26 x 1152 (~633M), patch_size 18, + segment embedding
     # ------------------------------------------------------------------
     cfg.model = config_dict.ConfigDict()
     cfg.model.name = "sdt"
     cfg.model.use_flash_attn = True
     cfg.model.self_condition = True
     cfg.model.center_inputs = True
-    cfg.model.patch_size = 18
 
-    cfg.model.embed_dim = 768
-    cfg.model.dim_ff = 3072
-    cfg.model.n_blocks = 12
-    cfg.model.n_heads = 12
+    cfg.model.patch_size = 18
+    cfg.model.use_segment_embed = True
+
+    cfg.model.embed_dim = 1152
+    cfg.model.dim_ff = 4608
+    cfg.model.n_blocks = 26
+    cfg.model.n_heads = 18                            # head_dim = 64
 
     cfg.model.head_type = "optimal_skip_mlp"
     cfg.model.out_dim = 1
@@ -93,7 +112,7 @@ def get_config():
     cfg.model.rope_base = 10_000.0
     cfg.model.abs_pos_mode = "local_only"
     cfg.model.n_fourier_global = 32
-    cfg.model.n_fourier_local = 8
+    cfg.model.n_fourier_local = 4
     cfg.model.use_adaln = True
     cfg.model.rpb_max_distance = 1
     cfg.model.use_swiglu = True
@@ -102,11 +121,10 @@ def get_config():
     cfg.model.continuous_logit_scaling = "matched_filter_residual"
     cfg.model.matched_filter_center = 0.5
     cfg.model.matched_filter_scale = 1.0
-    cfg.model.matched_filter_clip = 30.0    
-
+    cfg.model.matched_filter_clip = 30.0
 
     # ------------------------------------------------------------------
-    # Continuous diffusion
+    # Continuous diffusion (same proven EDM schedule)
     # ------------------------------------------------------------------
     cfg.diffusion = config_dict.ConfigDict()
     cfg.diffusion.continuous = config_dict.ConfigDict()
@@ -118,9 +136,8 @@ def get_config():
     cfg.diffusion.continuous.p_mean = -1.2
     cfg.diffusion.continuous.p_std = 1.2
 
-
     # ------------------------------------------------------------------
-    # Training
+    # Training -- MAIN: 2M steps, global batch 512 (32/GPU x 16 GH200)
     # ------------------------------------------------------------------
     cfg.train = config_dict.ConfigDict()
     cfg.train.deterministic = False
@@ -131,15 +148,15 @@ def get_config():
     cfg.train.amp_dtype = "bf16"
     cfg.train.allow_tf32 = True
     cfg.train.loss_type = "binary_sm"
-    
     cfg.train.loss_weighting = "edm"
 
-    cfg.train.batch_size = 512
-    cfg.train.epochs = 200
+    cfg.train.batch_size = 512           # global; trainer shards batch//world_size (512/16 = 32/GPU)
+    cfg.train.epochs = 110               # ~2M steps at 512 over ~11M samples (~21.4K steps/epoch); total_steps governs
     cfg.train.ema_decay = 0.9999
     cfg.train.sigma_sampling_strategy = "log-normal"
     cfg.train.self_condition_prob = 0.5
 
+    # Entropy schedule (same recipe as pilot).
     cfg.train.entropy_offline = config_dict.ConfigDict()
     cfg.train.entropy_offline.enabled = False
     cfg.train.entropy_compute = True
@@ -148,8 +165,8 @@ def get_config():
     cfg.train.entropy_num_bins = 128
     cfg.train.entropy_min_per_bin = 100
     cfg.train.entropy_update_every_steps = 2000
-    cfg.train.entropy_warmup_steps = 10_000 # TODO: back to 40_000 (check)
-    cfg.train.entropy_transition_steps = 3_000
+    cfg.train.entropy_warmup_steps = 40_000
+    cfg.train.entropy_transition_steps = 10_000
     cfg.train.entropy_gamma_max = 1.0
     cfg.train.entropy_mode = "regularized"
     cfg.train.entropy_regularizer_c = 0.1
@@ -161,34 +178,17 @@ def get_config():
     cfg.train.checkpointing.save_last = True
     cfg.train.checkpointing.save_top_k = 2
     cfg.train.checkpointing.mode = "min"
-
     cfg.train.checkpointing.interval = config_dict.ConfigDict()
     cfg.train.checkpointing.interval.enabled = True
     cfg.train.checkpointing.interval.every_steps = 50_000
     cfg.train.checkpointing.interval.keep_last = 0
-
     cfg.train.checkpointing.resume_interval = config_dict.ConfigDict()
     cfg.train.checkpointing.resume_interval.enabled = True
-    cfg.train.checkpointing.resume_interval.every_steps = 5_000
+    cfg.train.checkpointing.resume_interval.every_steps = 2_000
 
     cfg.train.sanity = config_dict.ConfigDict()
     cfg.train.sanity.enabled = False
     cfg.train.sanity.run_epoch = -1
-
-    cfg.train.generation = config_dict.ConfigDict()
-    cfg.train.generation.enabled = True
-    cfg.train.generation.splits = ["val"]
-    cfg.train.generation.every_epochs = 4
-    cfg.train.generation.num_samples = 64
-    cfg.train.generation.num_sampling_steps = 128
-    cfg.train.generation.samplers = ["ddim_entropic"]
-    cfg.train.generation.terminal_sigmas = [0.08]
-    cfg.train.generation.entropic_blend_alpha = 0.0
-    cfg.train.generation.entropy_ckpt_path = None
-    cfg.train.generation.guidance_scales = [0.0]
-    cfg.train.generation.micro_batch_size = 64
-    cfg.train.generation.sc_refresh_mode = "carry"
-    cfg.train.generation.sigma_max = None
 
     cfg.train.textaudio = config_dict.ConfigDict()
     cfg.train.textaudio.enabled = True
@@ -210,71 +210,48 @@ def get_config():
             spec.s_churns = list(s_churns) if s_churns is not None else [33.15]
         cfg.train.textaudio.sampling_sweep.specs.append(spec)
 
-    add_textaudio_spec('ddim_entropic', target_nfes=[256])
+    add_textaudio_spec('ddim_entropic', target_nfes=[256, 512, 1024])
     add_textaudio_spec('ddim_entropic', target_nfes=[256], stochastic_enabled=True, s_churns=[33.15])
+    add_textaudio_spec('ddim_entropic', target_nfes=[512,1024], stochastic_enabled=True, s_churns=[63.75])
+    
+
 
     # ------------------------------------------------------------------
-    # Optimizer / scheduler
+    # Optimizer / scheduler -- MAIN horizon 2M (cosine, stop-anytime)
     # ------------------------------------------------------------------
     cfg.optim = config_dict.ConfigDict()
     cfg.optim.optimizer = "AdamW"
-    cfg.optim.lr = 3e-4
+    cfg.optim.lr = 2e-4
     cfg.optim.weight_decay = 0.01
     cfg.optim.beta1 = 0.9
     cfg.optim.beta2 = 0.99
     cfg.optim.eps = 1e-8
     cfg.optim.grad_clip = 1.0
     cfg.optim.scheduler = "cosine_decay"
-    cfg.optim.total_steps = 140_000
-    cfg.optim.warmup = 2_500
+    cfg.optim.total_steps = 2_000_000
+    cfg.optim.warmup = 10_000
 
     # ------------------------------------------------------------------
-    # Evaluation
+    # Smoke mode (env-driven) -- single-GPU / R1 probe on a CC12M smoke cache
+    # ------------------------------------------------------------------
+    _smoke = int(os.environ.get("SMOKE_MAX_STEPS", "0") or 0)
+    if _smoke > 0:
+        cfg.experiment = f"{cfg.experiment}_smoke"
+        cfg.data.precomputed_root = f"{cfg.data.precomputed_root}_SMOKE"
+        cfg.optim.total_steps = _smoke
+        cfg.train.epochs = 1
+        cfg.train.checkpointing.interval.every_steps = max(_smoke // 2, 1)
+        cfg.train.checkpointing.resume_interval.every_steps = max(_smoke // 4, 1)
+        cfg.train.visualization.every_k_epochs = 1
+        cfg.train.vlb.every_k_epochs = 1
+        cfg.train.batch_size = int(os.environ.get("SMOKE_BATCH", "32"))
+        cfg.train.use_compile = bool(int(os.environ.get("SMOKE_COMPILE", "1")))
+        cfg.model.use_flash_attn = bool(int(os.environ.get("SMOKE_FLASH", "1")))
+
+    # ------------------------------------------------------------------
+    # Evaluation -- multimodal both-way + joint (inherits pilot protocol)
     # ------------------------------------------------------------------
     cfg.evaluation = config_dict.ConfigDict()
-    cfg.evaluation.checkpoint_path = f"runs/{cfg.experiment}/checkpoints/step=001000000.pt"
-    cfg.evaluation.out_dir = f"runs/{cfg.experiment}/evaluation_frontier_step1M"
-    cfg.evaluation.samples_dir = f"runs/{cfg.experiment}/evaluation_frontier_step1M/samples"
-    cfg.evaluation.results_csv = f"runs/{cfg.experiment}/evaluation_frontier_step1M/results.csv"
-    cfg.evaluation.shared_text_cache_dir = f"runs/{cfg.experiment}/evaluation_frontier_step1M/shared_text_cache"
-
-    cfg.evaluation.use_amp = True
-    cfg.evaluation.amp_dtype = "bf16"
-    cfg.evaluation.num_sampling_steps = 128
-    cfg.evaluation.use_compile = True
-    cfg.evaluation.compile_mode = "default"
-
-    cfg.evaluation.compile = config_dict.ConfigDict()
-    cfg.evaluation.compile.warmup = True
-    cfg.evaluation.compile.warmup_steps = 8
-
-    cfg.evaluation.ati = config_dict.ConfigDict()
-    cfg.evaluation.ati.enabled = False
-    cfg.evaluation.ati.eta = 0.0
-
-    cfg.evaluation.stochastic = config_dict.ConfigDict()
-    cfg.evaluation.stochastic.enabled = True
-    cfg.evaluation.stochastic.s_churn = 33.15
-    cfg.evaluation.stochastic.s_noise = 1.003
-    cfg.evaluation.stochastic.window_mode = 'full'
-
-    cfg.evaluation.sampling_sweep = config_dict.ConfigDict()
-    cfg.evaluation.sampling_sweep.enabled = True
-    cfg.evaluation.sampling_sweep.target_nfes = [8, 16, 32, 64, 128, 256, 512]
-    cfg.evaluation.sampling_sweep.specs = [
-        config_dict.ConfigDict({
-            "sampler_name": "ddim_entropic",
-            "sc_refresh_modes": ["carry"],
-            "target_nfes": [8, 16, 32, 64, 128],
-            "ati_etas": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
-        }),
-        config_dict.ConfigDict({
-            "sampler_name": "ddim_entropic",
-            "sc_refresh_modes": ["carry"],
-            "target_nfes": [256, 512, 1024],
-            "ati_etas": [0.0, 0.1, 0.2],
-        }),
-    ]
 
     # ------------------------------------------------------------------
     # Logging
@@ -282,8 +259,8 @@ def get_config():
     cfg.logging = config_dict.ConfigDict()
     cfg.logging.use_wandb = True
     cfg.logging.entity = None
-    cfg.logging.project = "libri"
-    cfg.logging.group = "libri_continuous_raw_binary_bits_trunk768"
+    cfg.logging.project = "textaudio_full"
+    cfg.logging.group = "full"
     cfg.logging.mode = "online"
     cfg.logging.watch_model = False
     cfg.logging.log_freq = 10

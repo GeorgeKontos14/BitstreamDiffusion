@@ -9,6 +9,7 @@ import random
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -21,7 +22,7 @@ from torch.amp import autocast
 from utils.tb_manager import TBManager
 from tqdm import tqdm
 
-from data import get_dataloaders
+from data import get_dataloaders, get_loader
 from models import create_model
 from utils.ema import EMA
 from utils.optim import get_optimizer_and_scheduler
@@ -37,7 +38,7 @@ from utils.callbacks import (
     VisualizationCallback,
     TextAudioCallback
 )
-from utils.textaudio_utils import _sample_tasks_and_cond_masks
+from utils.textaudio_utils import _sample_tasks_and_cond_masks, UNCONDITIONAL
 
 
 from utils.schedule_controller import EntropyScheduleController
@@ -571,6 +572,44 @@ def _dataloader_kwargs(cfg) -> dict:
         kw["persistent_workers"] = True
     return kw
 
+def _make_split_loader(
+    dataset,
+    cfg,
+    *,
+    shuffle: bool,
+    drop_last: bool,
+    ddp_active: bool,
+    world_size: int,
+    rank: int,
+) -> torch.utils.data.DataLoader:
+    dl_kw = _dataloader_kwargs(cfg)
+
+    if ddp_active:
+        batch_size = cfg.train.batch_size // world_size
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle,
+            drop_last=drop_last,
+        )
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            shuffle=False,
+            drop_last=drop_last,
+            **dl_kw,
+        )
+
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=cfg.train.batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        **dl_kw,
+    )
+
 def _resolve_checkpointing_cfg(cfg) -> dict:
     """
     Backward-compatible checkpointing config resolver.
@@ -684,7 +723,6 @@ def _load_text_speech_tokenizers(cfg, device):
 
     return text_tok, speech_tok
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Trainer
 # ──────────────────────────────────────────────────────────────────────────────
@@ -791,10 +829,22 @@ class Trainer:
                 mode = getattr(logging_cfg, "mode", "online")
                 run_name = cfg.experiment
 
+                # Reuse the same W&B run id across sequential launches of the same
+                # experiment (e.g. chained SLURM jobs) so logs land in one continuous
+                # run instead of a new one each time. If the config sets run_id
+                # explicitly, that always wins.
+                run_id = getattr(logging_cfg, "run_id", None)
+                wandb_id_path = self.run_dir / "wandb_run_id.txt"
+                if not run_id and wandb_id_path.exists():
+                    run_id = wandb_id_path.read_text().strip() or None
+                if not run_id:
+                    run_id = wandb.util.generate_id()
+                    wandb_id_path.write_text(run_id)
+
                 wandb.init(
                     project=project,
                     entity=entity,
-                    id=logging_cfg.run_id,
+                    id=run_id,
                     resume="allow",
                     name=run_name,
                     config=cfg_dict,
@@ -829,61 +879,23 @@ class Trainer:
 
         # ── data ────────────────────────────────────────────────────────────
         raw_train_loader, raw_val_loader, _ = get_dataloaders(cfg)
-        dl_kw = _dataloader_kwargs(cfg)
 
         if self.ddp_active:
             assert cfg.train.batch_size % self.world_size == 0, (
                 f"Global batch_size ({cfg.train.batch_size}) must be divisible by world_size "
                 f"({self.world_size}) for fixed-shape DDP training."
             )
-            batch_size_per_gpu = cfg.train.batch_size // self.world_size
 
-            train_sampler = DistributedSampler(
-                raw_train_loader.dataset,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                shuffle=True,
-                drop_last=True,
-            )
-            self.train_loader = torch.utils.data.DataLoader(
-                raw_train_loader.dataset,
-                batch_size=batch_size_per_gpu,
-                sampler=train_sampler,
-                shuffle=False,
-                drop_last=True,
-                **dl_kw,
-            )
-
-            val_sampler = DistributedSampler(
-                raw_val_loader.dataset,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                shuffle=False,
-                drop_last=True,
-            )
-            self.val_loader = torch.utils.data.DataLoader(
-                raw_val_loader.dataset,
-                batch_size=batch_size_per_gpu,
-                sampler=val_sampler,
-                shuffle=False,
-                drop_last=True,
-                **dl_kw,
-            )
-        else:
-            self.train_loader = torch.utils.data.DataLoader(
-                raw_train_loader.dataset,
-                batch_size=cfg.train.batch_size,
-                shuffle=True,
-                drop_last=True,
-                **dl_kw,
-            )
-            self.val_loader = torch.utils.data.DataLoader(
-                raw_val_loader.dataset,
-                batch_size=cfg.train.batch_size,
-                shuffle=False,
-                drop_last=True,
-                **dl_kw,
-            )
+        self.train_loader = _make_split_loader(
+            raw_train_loader.dataset, cfg,
+            shuffle=True, drop_last=True,
+            ddp_active=self.ddp_active, world_size=self.world_size, rank=self.rank,
+        )
+        self.val_loader = _make_split_loader(
+            raw_val_loader.dataset, cfg,
+            shuffle=False, drop_last=True,
+            ddp_active=self.ddp_active, world_size=self.world_size, rank=self.rank,
+        )
 
         # ── model ───────────────────────────────────────────────────────────
         base = create_model(cfg).to(self.device)
@@ -907,6 +919,7 @@ class Trainer:
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
                 find_unused_parameters=False,
+                bucket_cap_mb=200, # Increase multi-node capacity
             )
 
         compile_enabled = bool(getattr(self.cfg.train, "use_compile", False))
@@ -1031,7 +1044,7 @@ class Trainer:
         self._entropy_ln_std = None
 
         dataset = self.cfg.data.dataset
-        if dataset == 'libri':
+        if dataset == 'textaudio':
             text_tok, speech_tok = _load_text_speech_tokenizers(cfg, self.device)
             self.text_tok = text_tok
             self.speech_tok = speech_tok
@@ -1101,12 +1114,20 @@ class Trainer:
             if vis_cfg is not None and bool(getattr(vis_cfg, "enabled", False)):
                 self.callbacks.append(VisualizationCallback(cfg))
 
-            gen_cfg = getattr(cfg.train, 'generation', None)
+            # Text+audio generation
             textaudio_cfg = getattr(cfg.train, 'textaudio', None)
             if textaudio_cfg is not None and bool(getattr(textaudio_cfg, 'enabled', False)):
+                # Different datasets are required for cross-conditional task evaluation:
+                # Text-to-speech: speaker embedding extracted from a held out sample for each speaker
+                # Continuation: speaker embedding extracted from the 3-second prompt
+                self.val_loader_tts = SimpleNamespace(
+                    dataset=get_loader(cfg, split='val', task='tts').dataset
+                )
+                self.val_loader_cont = SimpleNamespace(
+                    dataset=get_loader(cfg, split='val', task='cont').dataset
+                )
+
                 self.callbacks.append(TextAudioCallback(cfg))
-            # if gen_cfg is not None and bool(getattr(gen_cfg, "enabled", False)):
-            #     self.callbacks.append(GenerationCallback(self.sampler, cfg, False))
 
         elif cfg.framework == "discrete_sedd":
             self.proc = DiscreteForwardProcess(cfg)
@@ -1289,7 +1310,7 @@ class Trainer:
                 print(f"⚠️  RNG state restore warning: {e}")
 
     def _load_checkpoint(self, path: Path):
-        ckpt = torch.load(path, map_location="cpu")
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         state_dict = ckpt["model"]
         clean_state_dict = {}
         for k, v in state_dict.items():
@@ -1320,7 +1341,8 @@ class Trainer:
             self._set_rng_state(ckpt["rng_state"])
 
         self.global_step = ckpt.get("global_step", 0)
-        start_epoch = ckpt.get("epoch", -1) + 1
+        epoch_complete = ckpt.get("epoch_complete", False)
+        start_epoch = (ckpt.get("epoch", -1) + 1) if epoch_complete else ckpt.get("epoch", 0)
         self.best_metric = ckpt.get("best_metric", self.best_metric)
         self.best_ckpts = ckpt.get("best_ckpts", self.best_ckpts)
         if self.is_master:
@@ -1350,7 +1372,7 @@ class Trainer:
 
         This is the "fresh run from weights" mode.
         """
-        ckpt = torch.load(path, map_location="cpu")
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         if "model" not in ckpt:
             raise KeyError(f"Checkpoint at {path} missing key 'model'.")
 
@@ -1500,7 +1522,7 @@ class Trainer:
                     self.cfg, B, S, device=self.device, bits_per_token=bpt
                 )
                 cL_pos = None
-                cond_enabled = bool(prefix_mask.any().item())
+                cond_enabled = bool((task_ids != UNCONDITIONAL).any())
             else:
                 cL_pos = _sample_cond_len_positions_per_example_continuous(
                     self.cfg, B, S, device=self.device
@@ -1820,7 +1842,7 @@ class Trainer:
         else:
             return metric > self.best_metric
 
-    def _build_ckpt_state(self, epoch: int) -> dict:
+    def _build_ckpt_state(self, epoch: int, epoch_complete: bool = True) -> dict:
         raw_model = _unwrap_all(self.model)
 
         # --- NEW: make EMA checkpoint portable (save shadows on CPU) ---
@@ -1844,6 +1866,7 @@ class Trainer:
             "rng_state": self._rng_state(),
             "best_metric": self.best_metric,
             "best_ckpts": self.best_ckpts,
+            "epoch_complete": epoch_complete,
         }
 
     def _save_ckpt(self, epoch: int, val_metric: float):
@@ -1903,7 +1926,7 @@ class Trainer:
         if int(self.global_step) < int(self._next_resume_ckpt_step):
             return
 
-        state = self._build_ckpt_state(epoch)
+        state = self._build_ckpt_state(epoch, epoch_complete=False)
 
         if self.save_last:
             tmp_path = self._checkpoint_path("last.tmp")
@@ -1933,7 +1956,7 @@ class Trainer:
             return
 
         # Build checkpoint state (same as others)
-        state = self._build_ckpt_state(epoch)
+        state = self._build_ckpt_state(epoch, epoch_complete=False)
 
         # Save
         name = f"step={int(self.global_step):09d}"

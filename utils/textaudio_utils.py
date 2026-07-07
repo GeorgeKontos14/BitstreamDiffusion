@@ -1,5 +1,13 @@
+import re
+
+import numpy as np
+
 import torch
 from ml_collections import config_dict
+
+from jiwer import wer, cer
+
+from typing import Any, Dict, List
 
 # Task IDs
 UNCONDITIONAL = 0
@@ -106,3 +114,131 @@ class UTMOS:
         gen_wav = torch.from_numpy(gen_wav).unsqueeze(0).to(self.device).float()
         score = self.predictor(gen_wav, self.sr)
         return score[0].item()
+    
+class TextAudioEvaluator:
+    def __init__(self, whisper_model: str = 'openai/whisper-medium', sr=16_000, _dbg_func=None):
+        self._whisper_name = whisper_model
+        self._sr = sr
+        self._asr = None
+        self._utmos = None
+        self._dbg_func = _dbg_func
+
+    def _dbg(self, msg: str):
+        if self._dbg_func:
+            self._dbg_func(msg)
+        else:
+            print(msg)
+
+    def _ensure_asr(self, device):
+        if self._asr is None:
+            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+            self._dbg(f'Loading {self._whisper_name} on {device}')
+            _model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                self._whisper_name, torch_dtype=torch.float16
+            ).to(device)
+            _proc = AutoProcessor.from_pretrained(self._whisper_name)
+            self._asr = pipeline(
+                'automatic-speech-recognition',
+                model=_model,
+                tokenizer = _proc.tokenizer,
+                feature_extractor=_proc.feature_extractor,
+                torch_dtype=torch.float16,
+                device=device,
+                chunk_length_s=30,
+            )
+        return self._asr
+
+
+    def transcribe(self, wavs, device) -> list[str]:
+        asr = self._ensure_asr(device)
+        inputs, valid_idx = [], []
+        for i, wav in enumerate(wavs):
+            if wav is None:
+                continue
+            arr = np.asarray(wav, dtype=np.float32).flatten()
+            if arr.ndim > 1:
+                arr = arr[0]
+            inputs.append({'array': arr, 'sampling_rate': self._sr})
+            valid_idx.append(i)
+        
+        results = [""]*len(wavs)
+        if inputs:
+            try:
+                preds = asr(inputs, batch_size=min(64, len(inputs)))
+                for idx, pred in zip(valid_idx, preds):
+                    results[idx] = pred['text'].strip()
+            except Exception as e:
+                self._dbg(f'ASR batch failed: {e}')
+
+        return results
+    
+    def _ensure_utmos(self):
+        if self._utmos is None:
+            self._dbg('Loading UTMOS')
+            self._utmos = UTMOS(sr=self._sr, use_gpu=torch.cuda.is_available())
+
+        return self._utmos
+    
+    def utmos_score(self, wavs) -> float:
+        model = self._ensure_utmos()
+        
+        scores = []
+        for wav in wavs:
+            if wav is None:
+                continue
+            arr = np.asarray(wav, dtype=np.float32).flatten()
+            if arr.ndim > 1:
+                arr = arr[0]
+            try:
+                scores.append(float(model.score(arr)))
+            except Exception as e:
+                self._dbg(f'UTMOS score failed: {e}')
+
+        return float(np.mean(scores)) if scores else float('nan')
+    
+    def normalize_text(self, text: str) -> str:
+        text = text.lower()
+        text = re.sub(r'[^\w\s]', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+    def word_error_rate(self, refs, hyps) -> float:
+        refs = [self.normalize_text(r) for r in refs]
+        hyps = [self.normalize_text(h) for h in hyps]
+        if not refs:
+            return float('nan')
+        return float(wer(refs, hyps))
+
+    def character_error_rate(self, refs, hyps) -> float:
+        refs = [self.normalize_text(r) for r in refs]
+        hyps = [self.normalize_text(h) for h in hyps]
+        if not refs:
+            return float('nan')
+        return float(cer(refs, hyps))
+    
+    def evaluate_task_brief(
+        self, task:str, gen_texts:List[str], ref_texts: List[str], gen_wavs, device
+    ) -> Dict[str, float]:
+        metrics = {}
+        transcriptions = None
+
+        if task == 'joint':
+            transcriptions = self.transcribe(gen_wavs, device)
+            metrics['Cross-Modal WER'] = self.word_error_rate(gen_texts, transcriptions)
+            metrics['Cross-Modal CER'] = self.character_error_rate(gen_texts, transcriptions)
+            metrics['UTMOS'] = self.utmos_score(gen_wavs)
+        elif task == 'tts':
+            transcriptions = self.transcribe(gen_wavs, device)
+            metrics['ASR-WER'] = self.word_error_rate(ref_texts, transcriptions)
+            metrics['ASR-CER'] = self.character_error_rate(ref_texts, transcriptions)
+            metrics['UTMOS'] = self.utmos_score(gen_wavs)
+        elif task == 'stt':
+            metrics['WER'] = self.word_error_rate(ref_texts, gen_texts)
+            metrics['CER'] = self.character_error_rate(ref_texts, gen_texts)
+        elif task == 'cont':
+            transcriptions = self.transcribe(gen_wavs, device)
+            metrics['UTMOS'] = self.utmos_score(gen_wavs)
+            metrics['WER'] = self.word_error_rate(gen_texts, transcriptions)
+            metrics['CER'] = self.character_error_rate(gen_texts, transcriptions)
+
+        return metrics, transcriptions

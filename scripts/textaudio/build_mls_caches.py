@@ -22,6 +22,8 @@ from build_textaudio_caches import (
     _worker_main,
     _merge_stats,
     _write_meta,
+    _create_zeroed_file,
+    _read_done_array,
 )
 
 # -----------------------------------------------------------------------------
@@ -62,18 +64,6 @@ def build_mls_cache_multinode(
     node_count: int,
     poll_interval: float = 10.0,
 ) -> None:
-    """Same packed-cache format as build_textaudio_caches.build_packed_cache, but
-    shards the currently-undone rows across `node_count` SLURM nodes (in addition
-    to this node's own GPUs) before each node runs its local mp.spawn worker pool.
-
-    All nodes share the same output files over the cluster's shared filesystem:
-    node 0 owns creating/resuming the memmap + done-array (other nodes poll a
-    marker file before touching them), and after each node finishes its shard it
-    posts its own completion marker; node 0 waits for all of them before doing
-    the atomic tmp -> cache_path rename and writing meta.json. No duration
-    filtering here (MLS is used as-is), so every node's independent
-    `load_dataset` call is guaranteed to produce identical n_samples/ordering.
-    """
     speech_vocab = compute_speech_vocab(speech_bottleneck, speech_bottleneck_dims)
     pad_token_text   = SPEECH_OFFSET + speech_vocab
     pad_token_speech = pad_token_text + 1
@@ -96,41 +86,57 @@ def build_mls_cache_multinode(
     print(f'[mls-cache] node {node_rank}: {n_samples:,} samples  seq_len={seq_len} -> {cache_path.name}')
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path         = cache_path.with_suffix('.tmp')
-    done_path        = cache_path.with_suffix('.done')
-    setup_ready_path = cache_path.with_suffix('.setup_ready.json')
-    stats_dir        = cache_path.parent / f'.{cache_path.stem}_stats_node{node_rank}'
-    node_trunc_path  = cache_path.parent / f'.{cache_path.stem}.node{node_rank}.trunc.json'
-    node_done_marker = cache_path.parent / f'.{cache_path.stem}.node{node_rank}.complete'
+    tmp_path             = cache_path.with_suffix('.tmp')
+    done_path            = cache_path.with_suffix('.done')
+    setup_ready_path     = cache_path.with_suffix('.setup_ready.json')
+    setup_ready_tmp_path = setup_ready_path.with_suffix('.tmp')
+    stats_dir            = cache_path.parent / f'.{cache_path.stem}_stats_node{node_rank}'
+    node_trunc_path      = cache_path.parent / f'.{cache_path.stem}.node{node_rank}.trunc.json'
+    node_done_marker     = cache_path.parent / f'.{cache_path.stem}.node{node_rank}.complete'
 
-    # ── setup: only node 0 creates/resumes the shared memmap + done array ──
+    # ── setup: only node 0 creates/resumes the shared backing array + done array ──
     if node_rank == 0:
         fresh = force or not (tmp_path.exists() and done_path.exists())
         if not fresh and done_path.stat().st_size != n_samples:
             print('[mls-cache] stale checkpoint (n_samples mismatch), starting fresh')
             fresh = True
 
+        # Per-node completion markers/stats describe *this* run, not the dataset
+        # checkpoint -- a previous, failed run's leftover markers must never be
+        # mistaken for this run's nodes having finished, so clear them on every
+        # setup (fresh or resuming), not just on a fresh rebuild.
+        for pattern in (f'.{cache_path.stem}.node*.trunc.json', f'.{cache_path.stem}.node*.complete'):
+            for p in cache_path.parent.glob(pattern):
+                p.unlink(missing_ok=True)
+
         if fresh:
             for p in (tmp_path, done_path):
                 p.unlink(missing_ok=True)
-            for pattern in (f'.{cache_path.stem}.node*.trunc.json', f'.{cache_path.stem}.node*.complete'):
-                for p in cache_path.parent.glob(pattern):
-                    p.unlink(missing_ok=True)
-            arr  = np.memmap(tmp_path,  dtype=np.uint32, mode='w+', shape=(n_samples, seq_len))
-            done = np.memmap(done_path, dtype=np.uint8,  mode='w+', shape=(n_samples,))
-            del arr, done
+            _create_zeroed_file(tmp_path, n_samples * seq_len * 4)
+            _create_zeroed_file(done_path, n_samples)
         else:
-            done = np.memmap(done_path, dtype=np.uint8, mode='r', shape=(n_samples,))
-            n_done = int(done.sum())
+            n_done = int(_read_done_array(done_path, n_samples).sum())
             print(f'[mls-cache] resuming: {n_done:,}/{n_samples:,} samples already done')
-            del done
 
-        setup_ready_path.write_text(json.dumps({'n_samples': n_samples}))
+        # Write-then-rename: Path.write_text() creates/truncates the file before
+        # writing its content, so another node polling `.exists()` on a shared
+        # filesystem can observe an empty file mid-write. os.replace is atomic --
+        # the target either doesn't exist yet or already has the full content.
+        setup_ready_tmp_path.write_text(json.dumps({'n_samples': n_samples}))
+        os.replace(setup_ready_tmp_path, setup_ready_path)
     else:
         print(f'[mls-cache] node {node_rank}: waiting for node 0 to finish setup...')
         while not setup_ready_path.exists():
             time.sleep(poll_interval)
-        info = json.loads(setup_ready_path.read_text())
+        info = None
+        for _ in range(10):
+            try:
+                info = json.loads(setup_ready_path.read_text())
+                break
+            except json.JSONDecodeError:
+                time.sleep(1.0)  # rare residual race even with atomic rename; retry briefly
+        if info is None:
+            raise RuntimeError(f'node {node_rank}: {setup_ready_path} exists but never parsed as JSON')
         assert info['n_samples'] == n_samples, (
             f'node {node_rank} sees n_samples={n_samples} but node 0 set up '
             f'{info["n_samples"]!r} -- dataset loading is not reproducing the same rows '
@@ -138,9 +144,7 @@ def build_mls_cache_multinode(
         )
 
     # ── shard the currently-undone rows across nodes, then across this node's GPUs ──
-    done_arr = np.memmap(done_path, dtype=np.uint8, mode='r', shape=(n_samples,))
-    undone = np.nonzero(done_arr == 0)[0]
-    del done_arr
+    undone = np.nonzero(_read_done_array(done_path, n_samples) == 0)[0]
 
     # Sort by duration so each GPU's batches group similar-length clips together.
     durations = np.asarray(dataset['audio_duration'], dtype=np.float64)
@@ -208,9 +212,16 @@ def build_mls_cache_multinode(
         cum_text_trunc   += info['n_text_truncated']
         cum_speech_trunc += info['n_speech_truncated']
 
-    done_arr = np.memmap(done_path, dtype=np.uint8, mode='r', shape=(n_samples,))
-    all_done = bool(done_arr.all())
-    del done_arr
+    # Every node has posted its completion marker, so in principle the done
+    # array should already be fully set -- but this is the one read where a
+    # remaining sliver of cross-node staleness would be most costly (it decides
+    # whether we finalize the cache), so retry a few times before giving up.
+    all_done = False
+    for attempt in range(5):
+        all_done = bool(_read_done_array(done_path, n_samples).all())
+        if all_done:
+            break
+        time.sleep(poll_interval)
     if not all_done:
         raise RuntimeError(
             'all nodes finished but not every row is marked done; rerun to continue.'
@@ -264,7 +275,7 @@ def main() -> None:
                     help='Comma-separated CUDA device indices local to this node, e.g. '
                          '"0,1,2,3". Defaults to all GPUs visible on this node.')
     ap.add_argument('--force', action='store_true')
-    ap.add_argument('--checkpoint_every', type=int, default=25)
+    ap.add_argument('--checkpoint_every', type=int, default=10)
     ap.add_argument('--poll_interval', type=float, default=10.0,
                     help='Seconds between filesystem polls when a node waits on another.')
     args = ap.parse_args()

@@ -4,6 +4,7 @@ import argparse
 import io
 import json
 import os
+import signal
 
 from pathlib import Path
 from typing import Tuple
@@ -295,6 +296,33 @@ def _merge_stats(stats_dir: Path, cum_text: int, cum_speech: int, trunc_path: Pa
     return cum_text, cum_speech
 
 
+# -----------------------------------------------------------------------------
+# Durable I/O for the shared checkpoint files
+# -----------------------------------------------------------------------------
+
+def _create_zeroed_file(path: Path, nbytes: int) -> None:
+    with open(path, 'wb') as f:
+        f.truncate(nbytes)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _read_done_array(done_path: Path, n_samples: int) -> np.ndarray:
+    data = done_path.read_bytes()
+    return np.frombuffer(data, dtype=np.uint8, count=n_samples).copy()
+
+
+def _pwrite_rows(fd: int, row_ids: np.ndarray, rows: np.ndarray, row_nbytes: int) -> None:
+    for i, r in enumerate(row_ids):
+        os.pwrite(fd, rows[i].tobytes(), int(r) * row_nbytes)
+
+
+def _pwrite_done(fd: int, row_ids: np.ndarray) -> None:
+    one = b'\x01'
+    for r in row_ids:
+        os.pwrite(fd, one, int(r))
+
+
 def _worker_main(
     local_rank: int,
     gpu_ids: list[int | None],
@@ -321,10 +349,6 @@ def _worker_main(
     stats_dir: Path,
     split_name: str,
 ) -> None:
-    """Encodes this rank's assigned dataset rows and writes them straight into the
-    shared memmap at their absolute row indices, so any number of ranks (this run
-    or a future one) can pick up whichever rows are still unmarked in `done_path`.
-    """
     indices = index_chunks[local_rank]
     if len(indices) == 0:
         return
@@ -343,8 +367,9 @@ def _worker_main(
         speech_bottleneck_dims=speech_bottleneck_dims,
     )
 
-    arr  = np.memmap(tmp_path,  dtype=np.uint32, mode='r+', shape=(n_samples, seq_len))
-    done = np.memmap(done_path, dtype=np.uint8,  mode='r+', shape=(n_samples,))
+    arr_fd  = os.open(tmp_path,  os.O_RDWR)
+    done_fd = os.open(done_path, os.O_RDWR)
+    row_nbytes = seq_len * 4  # uint32
 
     subset = dataset.select(indices.tolist())
     ds_ratio = stable_codec.model.downsampling_ratio
@@ -363,12 +388,20 @@ def _worker_main(
     stats_path = stats_dir / f'rank{local_rank}.json'
 
     def _checkpoint() -> None:
-        arr.flush()
-        done.flush()
+        os.fsync(arr_fd)
+        os.fsync(done_fd)
         stats_path.write_text(json.dumps({
             'n_text_truncated': n_text_truncated,
             'n_speech_truncated': n_speech_truncated,
         }))
+
+    stop_requested = False
+
+    def _handle_sigterm(signum, frame) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     try:
         for batch_idx, (wav_batch, texts, true_wav_lengths) in enumerate(tqdm(
@@ -396,18 +429,25 @@ def _worker_main(
                 [text_tokens.to(device), speaker_tokens, speech_tokens], dim=1,
             ).cpu().numpy().astype(np.uint32)  # (B, seq_len)
 
-            arr[row_ids] = combined
-            done[row_ids] = 1
+            _pwrite_rows(arr_fd, row_ids, combined, row_nbytes)
+            _pwrite_done(done_fd, row_ids)
 
             if (batch_idx + 1) % checkpoint_every == 0:
                 _checkpoint()
+
+            if stop_requested:
+                _checkpoint()
+                print(f'[textaudio-cache] {split_name} rank{local_rank}: SIGTERM received, '
+                      f'checkpointed at batch {batch_idx + 1} and exiting early')
+                return
 
         _checkpoint()
     except Exception:
         _checkpoint()
         raise
     finally:
-        del arr, done
+        os.close(arr_fd)
+        os.close(done_fd)
 
 
 # -----------------------------------------------------------------------------
@@ -468,7 +508,7 @@ def build_packed_cache(
     n_samples = len(dataset)
     print(f'[textaudio-cache] {n_samples:,} samples  seq_len={seq_len} -> {cache_path.name}')
 
-    # set up memmap + per-row done tracking (atomic finalize: .tmp -> cache_path)
+    # set up backing array + per-row done tracking (atomic finalize: .tmp -> cache_path)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path   = cache_path.with_suffix('.tmp')
     done_path  = cache_path.with_suffix('.done')
@@ -483,23 +523,18 @@ def build_packed_cache(
     if fresh:
         for p in (tmp_path, done_path, trunc_path):
             p.unlink(missing_ok=True)
-        arr  = np.memmap(tmp_path,  dtype=np.uint32, mode='w+', shape=(n_samples, seq_len))
-        done = np.memmap(done_path, dtype=np.uint8,  mode='w+', shape=(n_samples,))
-        del arr, done
+        _create_zeroed_file(tmp_path, n_samples * seq_len * 4)
+        _create_zeroed_file(done_path, n_samples)
         cum_text_trunc = 0
         cum_speech_trunc = 0
     else:
-        done = np.memmap(done_path, dtype=np.uint8, mode='r', shape=(n_samples,))
-        n_done = int(done.sum())
+        n_done = int(_read_done_array(done_path, n_samples).sum())
         print(f'[textaudio-cache] resuming: {n_done:,}/{n_samples:,} samples already done')
-        del done
         prev = json.loads(trunc_path.read_text()) if trunc_path.exists() else {}
         cum_text_trunc   = prev.get('n_text_truncated', 0)
         cum_speech_trunc = prev.get('n_speech_truncated', 0)
 
-    done_arr = np.memmap(done_path, dtype=np.uint8, mode='r', shape=(n_samples,))
-    undone = np.nonzero(done_arr == 0)[0]
-    del done_arr
+    undone = np.nonzero(_read_done_array(done_path, n_samples) == 0)[0]
 
     if len(undone) == 0:
         os.replace(tmp_path, cache_path)
@@ -545,9 +580,7 @@ def build_packed_cache(
 
     cum_text_trunc, cum_speech_trunc = _merge_stats(stats_dir, cum_text_trunc, cum_speech_trunc, trunc_path)
 
-    done_arr = np.memmap(done_path, dtype=np.uint8, mode='r', shape=(n_samples,))
-    all_done = bool(done_arr.all())
-    del done_arr
+    all_done = bool(_read_done_array(done_path, n_samples).all())
     if not all_done:
         raise RuntimeError(
             'workers finished but not every row is marked done; rerun to continue.'

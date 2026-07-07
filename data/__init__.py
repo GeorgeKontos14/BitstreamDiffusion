@@ -7,7 +7,7 @@ from ml_collections import config_dict
 
 from .openwebtext import OpenWebTextDataset
 from .lm1b import LM1BDataset
-from .textaudio import TextAudioDataset
+from .textaudio import TextAudioDataset, TextAudioTTSDataset, TextAudioContinuationDataset
 
 Split = Literal["train", "val", "test"]
 
@@ -23,6 +23,7 @@ def get_loader(
     batch_size: int | None = None,
     shuffle: bool | None = None,
     drop_last: bool | None = None,
+    task: str | None = None,
     seed: int = 42,
 ) -> DataLoader:
     """
@@ -66,12 +67,17 @@ def get_loader(
         ds = LM1BDataset(config, split=split)
         return _make_direct_loader(ds)
 
-    if name == 'libri':
-        ds = TextAudioDataset(config, split=split)
+    if name in {'textaudio', 'libri'}:
+        if task == 'tts':
+            ds = TextAudioTTSDataset(config, split=split)
+        elif task == 'cont':
+            ds = TextAudioContinuationDataset(config, split=split)
+        else:
+            ds = TextAudioDataset(config, split=split)
         return _make_direct_loader(ds)
 
     raise NotImplementedError(
-        f"Unknown dataset '{name}'. Supported: 'OpenWebText', 'LM1B', 'Libri'."
+        f"Unknown dataset '{name}'. Supported: 'OpenWebText', 'LM1B', 'Textaudio'."
     )
 
 
@@ -94,10 +100,10 @@ def get_dataloaders(
         from .lm1b import get_dataloaders as _lm1b_get_dataloaders
         return _lm1b_get_dataloaders(config, batch_size=batch_size, seed=seed)
 
-    if name == 'libri':
+    if name in {'textaudio', 'libri'}:
         from .textaudio import get_dataloaders as _textaudio_get_dataloaders
         return _textaudio_get_dataloaders(config, batch_size=batch_size, seed=seed)
 
     raise NotImplementedError(
-        f"Unknown dataset '{name}'. Supported: 'OpenWebText', 'LM1B'."
+        f"Unknown dataset '{name}'. Supported: 'OpenWebText', 'LM1B', 'Textaudio'."
     )

@@ -4,6 +4,7 @@ import json
 import math
 import time
 import wave
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -11,8 +12,6 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 from torch.cuda.amp import autocast
-
-from jiwer import wer
 
 try:
     import wandb
@@ -24,7 +23,7 @@ try:
 except Exception:
     dist = None
 
-from utils.textaudio_utils import _fixed_mask, _safe_decode, UTMOS
+from utils.textaudio_utils import _fixed_mask, _safe_decode, TextAudioEvaluator
 from utils.textaudio_report import build_textaudio_report
 from utils.model_utils import unwrap_model
 
@@ -86,6 +85,17 @@ def _write_wav(path, arr, sr: int) -> None:
 # Config resolution
 # -----------------------------------------------------------------------------
 @dataclass
+class _SamplerSpec:
+    tag: str              # unique key used for logging/results/save-to-disk
+    sampler_name: str     # base algorithm, e.g. "ddim_entropic"
+    num_steps: int
+    target_nfe: int
+    actual_nfe: int
+    stochastic_enabled: bool
+    s_churn: Optional[float]
+
+
+@dataclass
 class _ResolvedTextAudio:
     enabled: bool
     every_k_epochs: int
@@ -93,9 +103,8 @@ class _ResolvedTextAudio:
     split: str
 
     num_samples: int
-    samplers: List[str]
+    samplers: List[_SamplerSpec]
     terminal_sigma: float
-    num_steps: int
     entropic_blend_alpha: float
     entropy_run_dir: Optional[str]
     seed: int
@@ -120,37 +129,71 @@ def _first_scalar(x, default=None):
         return x[0] if len(x) > 0 else default
     return x
 
-def _sanitize_sampler_name(x, default: str = "ddim_entropic") -> str:
-    if x is None:
-        return default
+def _build_sampler_specs(cfg: Any, c: Any) -> List[_SamplerSpec]:
+    """
+    Expands cfg.train.textaudio.sampling_sweep.specs (mirrors
+    cfg.evaluation.sampling_sweep.specs, see configs/owt/eval_*.py) into one
+    _SamplerSpec per (target_nfe x s_churn) combination.
+    """
+    from evaluation.nfe import steps_for_target_nfe
 
-    if isinstance(x, (list, tuple)):
-        x = x[0] if len(x) > 0 else default
+    framework = str(getattr(cfg, 'framework', 'continuous_score'))
+    self_condition = bool(getattr(getattr(cfg, 'model', None), 'self_condition', False))
 
-    s = str(x).strip()
+    sweep = getattr(c, 'sampling_sweep', None) if c is not None else None
+    raw_specs = list(getattr(sweep, 'specs', [])) if sweep is not None else []
+    if not raw_specs:
+        raise ValueError(
+            "cfg.train.textaudio.sampling_sweep.specs must define at least one spec "
+            "(sampler_name + target_nfes, optionally stochastic_enabled + s_churns)."
+        )
 
-    if s.startswith("[") and s.endswith("]"):
-        inner = s[1:-1].strip()
-        if "," in inner:
-            inner = inner.split(",", 1)[0].strip()
-        inner = inner.strip().strip("'").strip('"')
-        if inner:
-            s = inner
+    specs: List[_SamplerSpec] = []
+    seen_tags = set()
 
-    return s or default
+    for base in raw_specs:
+        sampler_name = str(base.sampler_name)
+        target_nfes = [int(n) for n in base.target_nfes]
+        stochastic_enabled = bool(getattr(base, 'stochastic_enabled', False))
 
-def _sanitize_sampler_list(x, default: str = "ddim_entropic") -> List[str]:
-    if x is None:
-        return [default]
-    if isinstance(x, (list, tuple)):
-        seen, result = set(), []
-        for item in x:
-            name = _sanitize_sampler_name(item, default)
-            if name not in seen:
-                seen.add(name)
-                result.append(name)
-        return result or [default]
-    return [_sanitize_sampler_name(x, default)]
+        if stochastic_enabled:
+            s_churns = [float(v) for v in getattr(base, 's_churns', [])]
+            if not s_churns:
+                raise ValueError(
+                    f"stochastic_enabled=True but no s_churns given for sampler_name={sampler_name!r}"
+                )
+        else:
+            s_churns = [None]
+
+        for target_nfe in target_nfes:
+            num_steps, actual_nfe = steps_for_target_nfe(
+                framework=framework,
+                sampler_name=sampler_name,
+                target_nfe=target_nfe,
+                self_condition=self_condition,
+                sc_refresh_mode="refined",
+                return_probs=True,
+            )
+            for s_churn in s_churns:
+                tag = f"{sampler_name}_nfe{target_nfe}"
+                if stochastic_enabled:
+                    tag += f"_stoch-ch{s_churn:g}"
+
+                if tag in seen_tags:
+                    raise ValueError(f"Duplicate textaudio sampling spec tag: {tag!r}")
+                seen_tags.add(tag)
+
+                specs.append(_SamplerSpec(
+                    tag=tag,
+                    sampler_name=sampler_name,
+                    num_steps=num_steps,
+                    target_nfe=target_nfe,
+                    actual_nfe=actual_nfe,
+                    stochastic_enabled=stochastic_enabled,
+                    s_churn=s_churn,
+                ))
+
+    return specs
 
 def _resolve_cfg(cfg: Any) -> _ResolvedTextAudio:
     train = getattr(cfg, 'train', None)
@@ -190,16 +233,7 @@ def _resolve_cfg(cfg: Any) -> _ResolvedTextAudio:
         return default
     
     num_samples = int(pick('num_samples', 'num_samples', 64))
-    raw_sampler = None
-    if c is not None:
-        raw_sampler = getattr(c, "sampler", None)
-        if raw_sampler is None:
-            raw_sampler = getattr(c, "samplers", None)
-    if raw_sampler is None and gen is not None:
-        raw_sampler = getattr(gen, "sampler", None)
-        if raw_sampler is None:
-            raw_sampler = getattr(gen, "samplers", None)
-    samplers = _sanitize_sampler_list(raw_sampler, default="ddim_entropic")
+    samplers = _build_sampler_specs(cfg, c)
 
     terminal_sigma = getattr(c, "terminal_sigma", None) if c is not None else None
     if terminal_sigma is None and c is not None:
@@ -207,13 +241,6 @@ def _resolve_cfg(cfg: Any) -> _ResolvedTextAudio:
     if terminal_sigma is None and gen is not None:
         terminal_sigma = getattr(gen, "terminal_sigmas", None)
     terminal_sigma = float(_first_scalar(terminal_sigma, 0.08))
-
-    num_steps = int(
-        (getattr(c, "num_steps", None) if c is not None else None)
-        or (getattr(c, "num_sampling_steps", None) if c is not None else None)
-        or (getattr(gen, "num_sampling_steps", None) if gen is not None else None)
-        or 64
-    )
 
     entropic_blend_alpha = float(pick("entropic_blend_alpha", "entropic_blend_alpha", 0.0))
 
@@ -251,7 +278,6 @@ def _resolve_cfg(cfg: Any) -> _ResolvedTextAudio:
         num_samples=num_samples,
         samplers=samplers,
         terminal_sigma=terminal_sigma,
-        num_steps=num_steps,
         entropic_blend_alpha=entropic_blend_alpha,
         entropy_run_dir=entropy_run_dir,
         seed=seed,
@@ -269,133 +295,6 @@ def _resolve_cfg(cfg: Any) -> _ResolvedTextAudio:
 
 TASKS = ['joint', 'tts', 'stt', 'cont']
 
-class TextAudioEvaluator:
-    def __init__(self, whisper_model: str = 'openai/whisper-medium', sr=16_000):
-        self._whisper_name = whisper_model
-        self._sr = sr
-        self._asr = None
-        self._utmos = None
-
-    def _ensure_asr(self, device):
-        if self._asr is None:
-            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
-            _dbg(f'Loading {self._whisper_name} on {device}')
-            _model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                self._whisper_name, torch_dtype=torch.float16
-            ).to(device)
-            _proc = AutoProcessor.from_pretrained(self._whisper_name)
-            self._asr = pipeline(
-                'automatic-speech-recognition',
-                model=_model,
-                tokenizer = _proc.tokenizer,
-                feature_extractor=_proc.feature_extractor,
-                torch_dtype=torch.float16,
-                device=device
-            )
-        return self._asr
-
-
-    def transcribe(self, wavs, device) -> list[str]:
-        asr = self._ensure_asr(device)
-        inputs, valid_idx = [], []
-        for i, wav in enumerate(wavs):
-            if wav is None:
-                continue
-            arr = np.asarray(wav, dtype=np.float32).flatten()
-            if arr.ndim > 1:
-                arr = arr[0]
-            inputs.append({'array': arr, 'sampling_rate': self._sr})
-            valid_idx.append(i)
-        
-        results = [""]*len(wavs)
-        if inputs:
-            try:
-                preds = asr(inputs, batch_size=min(64, len(inputs)))
-                for idx, pred in zip(valid_idx, preds):
-                    results[idx] = pred['text'].strip()
-            except Exception as e:
-                _dbg(f'ASR batch failed: {e}')
-
-        return results
-    
-    def _ensure_utmos(self):
-        if self._utmos is None:
-            _dbg('Loading UTMOS')
-            self._utmos = UTMOS(sr=self._sr, use_gpu=torch.cuda.is_available())
-
-        return self._utmos
-    
-    def utmos_score(self, wavs) -> float:
-        model = self._ensure_utmos()
-        
-        scores = []
-        for wav in wavs:
-            if wav is None:
-                continue
-            arr = np.asarray(wav, dtype=np.float32).flatten()
-            if arr.ndim > 1:
-                arr = arr[0]
-            try:
-                scores.append(float(model.score(arr)))
-            except Exception as e:
-                _dbg(f'UTMOS score failed: {e}')
-
-        return float(np.mean(scores)) if scores else float('nan')
-    
-    @staticmethod
-    def word_error_rate(refs, hyps) -> float:
-        refs = [r.lower() for r in refs]
-        hyps = [h.lower() for h in hyps]
-        if not refs:
-            return float('nan')
-        return float(wer(refs, hyps))
-    
-    def evaluate_task(
-        self, task:str, gen_texts:List[str], ref_texts: List[str], gen_wavs, device
-    ) -> Dict[str, float]:
-        metrics = {}
-        transcriptions = None
-
-        if task == 'joint':
-            transcriptions = self.transcribe(gen_wavs, device)
-            metrics['wer'] = self.word_error_rate(gen_texts, transcriptions)
-            metrics['utmos'] = self.utmos_score(gen_wavs)
-        elif task == 'tts':
-            transcriptions = self.transcribe(gen_wavs, device)
-            metrics['wer'] = self.word_error_rate(ref_texts, transcriptions)
-            metrics['utmos'] = self.utmos_score(gen_wavs)
-        elif task == 'stt':
-            metrics['wer'] = self.word_error_rate(ref_texts, gen_texts)
-        elif task == 'cont':
-            metrics['utmos'] = self.utmos_score(gen_wavs)
-
-        return metrics, transcriptions
-    
-# -----------------------------------------------------------------------------
-# Config patch: disable stochastic churn for the deterministic DDIMSampler.
-# The stochastic variant reads evaluation.stochastic directly from the real cfg,
-# matching exactly how the OWT eval configs and GenerationCallback work.
-# -----------------------------------------------------------------------------
-
-class _DetCfgPatch:
-    """Wraps cfg so that cfg.evaluation.stochastic.enabled is always False."""
-    class _NoStoch:
-        enabled = False
-
-    class _DetEvalPatch:
-        def __init__(self, base_eval):
-            self._base = base_eval
-            self.stochastic = _DetCfgPatch._NoStoch()
-        def __getattr__(self, name):
-            return getattr(self._base, name)
-
-    def __init__(self, base_cfg):
-        self._base = base_cfg
-        self.evaluation = self._DetEvalPatch(getattr(base_cfg, "evaluation", object()))
-
-    def __getattr__(self, name):
-        return getattr(self._base, name)
-
 
 # -----------------------------------------------------------------------------
 # Callback
@@ -406,14 +305,13 @@ class TextAudioCallback:
     def __init__(self, cfg: Any):
         self.cfg = cfg
         self._ddim_sampler = None
-        self._ddim_sampler_stoch = None
         self._evaluator = None
         self._last_run_key = None
 
     def _ensure_evaluator(self, r: _ResolvedTextAudio) -> None:
         if self._evaluator is not None:
             return
-        self._evaluator = TextAudioEvaluator(r.whisper_model, r.sample_rate)
+        self._evaluator = TextAudioEvaluator(r.whisper_model, r.sample_rate, _dbg)
 
     def _should_run(self, epoch: int, r: _ResolvedTextAudio) -> bool:
         if not r.enabled:
@@ -425,10 +323,31 @@ class TextAudioCallback:
         return ((int(epoch) + 1) % k) == 0
     
     @torch.no_grad()
-    def _sample_real_data(self, trainer, B: int, split: str) -> Optional[torch.Tensor]:
-        loader = getattr(trainer, f'{split}_loader', None)
+    def _sample_real_data_for_task(
+        self, trainer, B: int, split: str, task: str
+    ) -> Optional[torch.Tensor]:
+        data_cfg = trainer.cfg.data
+        text_seq_len = int(data_cfg.text_seq_len)
+        bits_per_token = int(data_cfg.bits_per_token)
+        sequence_len = int(data_cfg.sequence_len)
+        
+        if task == 'joint':
+            return torch.zeros(B, sequence_len, device=trainer.device, dtype=torch.float32)
+
+        # Use the appropriate conditioning data for each type of task
+        if task == 'tts':
+            loader = getattr(trainer, f'{split}_loader_tts', None)
+            start = 0
+        elif task == 'cont':
+            loader = getattr(trainer, f'{split}_loader_cont', None)
+            start = text_seq_len * bits_per_token
+        else:
+            loader = getattr(trainer, f'{split}_loader', None)
+            start = 0
+
         if loader is None:
             return None
+
         dataset = loader.dataset
         if len(dataset) == 0:
             return None
@@ -442,33 +361,79 @@ class TextAudioCallback:
             sample = sample.view(-1).to(device=trainer.device, dtype=torch.float32, non_blocking=True)
             chunks.append(sample.unsqueeze(0))
 
-        return torch.cat(chunks, dim=0).contiguous()
-    
+        partial = torch.cat(chunks, dim=0).contiguous()
+
+        if task == 'stt':
+            return partial
+
+        full = torch.zeros(partial.size(0), sequence_len, device=trainer.device, dtype=torch.float32)
+        full[:, start:start + partial.size(1)] = partial
+        return full
+
     def _get_sampler(self, trainer, sampler_name: str):
         raw = trainer.model.module if hasattr(trainer.model, 'module') else trainer.model
         if "ddim" in sampler_name:
             from diffusion.continuous.samplers import DDIMSampler
-            if sampler_name.endswith('_stoch'):
-                # Stochastic: reads evaluation.stochastic from the real cfg as-is.
-                if self._ddim_sampler_stoch is None:
-                    self._ddim_sampler_stoch = DDIMSampler(raw, trainer.proc, self.cfg)
-                return self._ddim_sampler_stoch
-            else:
-                # Deterministic: patch cfg to keep stochastic churn disabled.
-                if self._ddim_sampler is None:
-                    self._ddim_sampler = DDIMSampler(raw, trainer.proc, _DetCfgPatch(self.cfg))
-                return self._ddim_sampler
+            if self._ddim_sampler is None:
+                self._ddim_sampler = DDIMSampler(raw, trainer.proc, self.cfg)
+            return self._ddim_sampler
         return trainer.sampler
+
+    @contextmanager
+    def _stochastic_cfg_override(self, overrides: Dict[str, Any]):
+        if not overrides:
+            yield
+            return
+
+        ev = getattr(self.cfg, 'evaluation', None)
+        if ev is None:
+            yield
+            return
+
+        st = getattr(ev, 'stochastic', None)
+        st_existed = st is not None
+        if st is None:
+            from ml_collections import config_dict
+            ev.stochastic = config_dict.ConfigDict()
+            st = ev.stochastic
+
+        backup = {}
+        for key, value in overrides.items():
+            backup[key] = (hasattr(st, key), getattr(st, key, None))
+            setattr(st, key, value)
+
+        try:
+            yield
+        finally:
+            for key, (existed, old_val) in backup.items():
+                if existed:
+                    setattr(st, key, old_val)
+                else:
+                    try:
+                        delattr(st, key)
+                    except AttributeError:
+                        pass
+            if not st_existed:
+                try:
+                    delattr(ev, 'stochastic')
+                except AttributeError:
+                    pass
 
     def _generate_task(
         self, trainer, x_full: torch.Tensor, task_id: int, B: int, r: _ResolvedTextAudio,
-        sampler_name: str,
+        spec: _SamplerSpec,
     ) -> torch.Tensor:
         cond_mask = _fixed_mask(
             self.cfg, B, r.sequence_len, task_id, device=trainer.device, bits_per_token=r.bits_per_token
         )
-        schedule = 'entropic' if 'entropic' in sampler_name else 'karras'
-        sampler_obj = self._get_sampler(trainer, sampler_name)
+        schedule = 'entropic' if 'entropic' in spec.sampler_name else 'karras'
+        sampler_obj = self._get_sampler(trainer, spec.sampler_name)
+
+        stoch_overrides: Dict[str, Any] = {}
+        if not spec.stochastic_enabled:
+            stoch_overrides['enabled'] = False
+        elif spec.s_churn is not None:
+            stoch_overrides['s_churn'] = spec.s_churn
 
         entropy_run_dir = r.entropy_run_dir
         if entropy_run_dir is None:
@@ -480,18 +445,19 @@ class TextAudioCallback:
             guidance_scale=0.0
         )
 
-        _, probs = sampler_obj.sample(
-            B, r.sequence_len,
-            schedule=schedule,
-            num_steps=r.num_steps,
-            entropic_blend_alpha=r.entropic_blend_alpha,
-            entropy_run_dir=entropy_run_dir,
-            sigma_min_override=r.terminal_sigma,
-            return_probs=True,
-            progress=True,
-            **cond_kwargs
-        )
-        
+        with self._stochastic_cfg_override(stoch_overrides):
+            _, probs = sampler_obj.sample(
+                B, r.sequence_len,
+                schedule=schedule,
+                num_steps=spec.num_steps,
+                entropic_blend_alpha=r.entropic_blend_alpha,
+                entropy_run_dir=entropy_run_dir,
+                sigma_min_override=r.terminal_sigma,
+                return_probs=True,
+                progress=True,
+                **cond_kwargs
+            )
+
         bits = (probs > 0.5).to(torch.long)
         bits[cond_mask] = (x_full[cond_mask] > 0.5).to(torch.long)
         return bits
@@ -684,22 +650,27 @@ class TextAudioCallback:
                 'num_samples': r.num_samples,
                 'samplers': [
                     {
-                        'name': s,
-                        'num_steps': r.num_steps,
+                        'name': spec.tag,
+                        'sampler_name': spec.sampler_name,
+                        'num_steps': spec.num_steps,
+                        'target_nfe': spec.target_nfe,
+                        'actual_nfe': spec.actual_nfe,
+                        'stochastic_enabled': spec.stochastic_enabled,
+                        's_churn': spec.s_churn,
                         'terminal_sigma': r.terminal_sigma,
                     }
-                    for s in r.samplers
+                    for spec in r.samplers
                 ],
                 'sample_rate': r.sample_rate,
             },
             'samplers': {},
         }
 
-        for sampler_name, task_results in all_results.items():
+        for sampler_tag, task_results in all_results.items():
             sampler_entry: Dict[str, dict] = {'tasks': {}}
 
             for task, res in task_results.items():
-                task_dir = save_dir / sampler_name / task
+                task_dir = save_dir / sampler_tag / task
                 task_dir.mkdir(parents=True, exist_ok=True)
 
                 gen_texts = res.get('gen_texts', [])
@@ -721,12 +692,12 @@ class TextAudioCallback:
                         sample['ref_text'] = ref_texts[i]
 
                     if task in ('joint', 'tts', 'cont'):
-                        wav_rel = f'{sampler_name}/{task}/gen_{i:04d}.wav'
+                        wav_rel = f'{sampler_tag}/{task}/gen_{i:04d}.wav'
                         _write_wav(save_dir / wav_rel, gen_wavs[i], r.sample_rate)
                         sample['gen_wav'] = wav_rel
 
                     if task in ('tts', 'stt'):
-                        wav_rel = f'{sampler_name}/{task}/ref_{i:04d}.wav'
+                        wav_rel = f'{sampler_tag}/{task}/ref_{i:04d}.wav'
                         _write_wav(save_dir / wav_rel, ref_wavs[i], r.sample_rate)
                         sample['ref_wav'] = wav_rel
 
@@ -747,7 +718,7 @@ class TextAudioCallback:
                     'samples': samples,
                 }
 
-            report_data['samplers'][sampler_name] = sampler_entry
+            report_data['samplers'][sampler_tag] = sampler_entry
 
         with open(save_dir / 'data.json', 'w', encoding='utf-8') as f:
             json.dump(report_data, f, indent=4, ensure_ascii=False)
@@ -778,6 +749,10 @@ class TextAudioCallback:
         raw = unwrap_model(trainer.model)
 
         # ── ALL ranks: EMA, eval, generate ──────────────────
+        task_x_full: Dict[str, torch.Tensor] = {}
+        sampler_task_bits: Dict[str, Dict[str, torch.Tensor]] = {spec.tag: {} for spec in r.samplers}
+        has_data = False
+
         try:
             trainer.model.eval()
             trainer.ema.apply(trainer.model)   # match _validate_epoch
@@ -786,38 +761,37 @@ class TextAudioCallback:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(r.seed)
 
-            x_full = self._sample_real_data(trainer, B, r.split)
-            has_data = x_full is not None
+            amp_dtype = getattr(trainer, "amp_dtype", torch.float16)
+            sampler_tags = [spec.tag for spec in r.samplers]
 
-            if has_data:
-                B = x_full.size(0)
-                if _rank0():
-                    _dbg(
-                        f"START epoch={epoch} split={r.split} "
-                        f"B={B} steps={r.num_steps} samplers={r.samplers} "
-                        f"sigma={r.terminal_sigma}"
-                    )
+            with autocast(enabled=r.use_amp, dtype=amp_dtype):
+                for task_id, task in enumerate(TASKS):
+                    x_full = self._sample_real_data_for_task(trainer, B, r.split, task)
+                    if x_full is None:
+                        if _rank0():
+                            _dbg(f"No data from {r.split} split for task={task}")
+                        continue
 
-                amp_dtype = getattr(trainer, "amp_dtype", torch.float16)
-                sampler_task_bits: Dict[str, Dict[str, torch.Tensor]] = {}
+                    has_data = True
+                    task_B = x_full.size(0)
+                    task_x_full[task] = x_full
 
-                with autocast(enabled=r.use_amp, dtype=amp_dtype):
-                    for sampler_name in r.samplers:
-                        task_bits: Dict[str, torch.Tensor] = {}
-                        for task_id, task in enumerate(TASKS):
+                    if _rank0():
+                        _dbg(
+                            f"START epoch={epoch} split={r.split} task={task} "
+                            f"B={task_B} samplers={sampler_tags} "
+                            f"sigma={r.terminal_sigma}"
+                        )
+
+                    for spec in r.samplers:
+                        if _rank0():
+                            _dbg(f"  {r.split}_{task} [{spec.tag}]: generating {task_B} samples (steps={spec.num_steps})")
+                        try:
+                            bits = self._generate_task(trainer, x_full, task_id, task_B, r, spec)
+                            sampler_task_bits[spec.tag][task] = bits
+                        except Exception as e:
                             if _rank0():
-                                _dbg(f"  {r.split}_{task} [{sampler_name}]: generating {B} samples")
-                            try:
-                                bits = self._generate_task(trainer, x_full, task_id, B, r, sampler_name)
-                                task_bits[task] = bits
-                            except Exception as e:
-                                if _rank0():
-                                    _dbg(f"  {r.split}_{task} [{sampler_name}]: generation failed: {e}")
-                        sampler_task_bits[sampler_name] = task_bits
-            else:
-                sampler_task_bits = {}
-                if _rank0():
-                    _dbg(f"No data from {r.split} split")
+                                _dbg(f"  {r.split}_{task} [{spec.tag}]: generation failed: {e}")
 
         finally:
             trainer.ema.restore(trainer.model)   # match _validate_epoch
@@ -827,16 +801,16 @@ class TextAudioCallback:
         if not _rank0():
             return
 
-        if has_data and sampler_task_bits:
+        if has_data and any(sampler_task_bits.values()):
             step = _global_step(trainer, epoch)
             self._ensure_evaluator(r)
-            all_results: Dict[str, Dict[str, dict]] = {}  # {sampler_name: {task: result}}
+            all_results: Dict[str, Dict[str, dict]] = {}  # {sampler_tag: {task: result}}
 
-            for sampler_name, task_bits in sampler_task_bits.items():
+            for sampler_tag, task_bits in sampler_task_bits.items():
                 sampler_results: Dict[str, dict] = {}
 
                 for task, bits in task_bits.items():
-                    _dbg(f"  {r.split}_{task} [{sampler_name}]: decoding+evaluating")
+                    _dbg(f"  {r.split}_{task} [{sampler_tag}]: decoding+evaluating")
                     try:
                         needs_gen_text = task in ("joint", "stt", "cont")
                         needs_gen_wav  = task in ("joint", "tts", "cont")
@@ -850,16 +824,16 @@ class TextAudioCallback:
                         ref_wavs  = None
                         if needs_ref:
                             ref_token_ids = self._bits_to_token_ids(
-                                (x_full > 0.5).to(torch.long), r,
+                                (task_x_full[task] > 0.5).to(torch.long), r,
                             )
                             ref_texts = self._decode_texts(trainer, ref_token_ids, r)
                             ref_wavs  = self._decode_speech_wavs(trainer, ref_token_ids, r)
 
-                        metrics, transcriptions = self._evaluator.evaluate_task(
+                        metrics, transcriptions = self._evaluator.evaluate_task_brief(
                             task, gen_texts, ref_texts, gen_wavs, trainer.device,
                         )
                     except Exception as e:
-                        _dbg(f"  {r.split}_{task} [{sampler_name}]: eval failed: {e}")
+                        _dbg(f"  {r.split}_{task} [{sampler_tag}]: eval failed: {e}")
                         continue
 
                     sampler_results[task] = {
@@ -868,14 +842,14 @@ class TextAudioCallback:
                         "ref_wavs": ref_wavs, "transcriptions": transcriptions,
                     }
 
-                    tag = f"{r.split}_{task}/{sampler_name}"
+                    tag = f"{r.split}_{task}/{sampler_tag}"
                     self._log_scalars(trainer, metrics, tag, step)
                     self._log_samples(
                         trainer, task, tag, step,
                         gen_texts, ref_texts, gen_wavs, ref_wavs, transcriptions, r,
                     )
 
-                all_results[sampler_name] = sampler_results
+                all_results[sampler_tag] = sampler_results
 
             if all_results:
                 try:
@@ -891,3 +865,4 @@ class TextAudioCallback:
             except Exception:
                 pass
         _dbg(f"END ({elapsed:.1f}s)")
+
