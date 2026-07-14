@@ -300,7 +300,7 @@ TASKS = ['joint', 'tts', 'stt', 'cont']
 # Callback
 # -----------------------------------------------------------------------------
 class TextAudioCallback:
-    run_on_all_ranks=True
+    run_on_all_ranks=False
 
     def __init__(self, cfg: Any):
         self.cfg = cfg
@@ -432,8 +432,10 @@ class TextAudioCallback:
         stoch_overrides: Dict[str, Any] = {}
         if not spec.stochastic_enabled:
             stoch_overrides['enabled'] = False
-        elif spec.s_churn is not None:
-            stoch_overrides['s_churn'] = spec.s_churn
+        else:
+            stoch_overrides['enabled'] = True
+            if spec.s_churn is not None:
+                stoch_overrides['s_churn'] = spec.s_churn
 
         entropy_run_dir = r.entropy_run_dir
         if entropy_run_dir is None:
@@ -735,6 +737,8 @@ class TextAudioCallback:
         
         if not self._should_run(epoch, r):
             return
+        if not _rank0():
+            return  # generation output is master-only; no other rank needs to run this
 
         run_key = (int(epoch), _global_step(trainer, epoch))
         
@@ -748,7 +752,7 @@ class TextAudioCallback:
         B = r.num_samples
         raw = unwrap_model(trainer.model)
 
-        # ── ALL ranks: EMA, eval, generate ──────────────────
+        # ── EMA, eval, generate (rank 0 only; enforced at function entry) ──
         task_x_full: Dict[str, torch.Tensor] = {}
         sampler_task_bits: Dict[str, Dict[str, torch.Tensor]] = {spec.tag: {} for spec in r.samplers}
         has_data = False
@@ -797,9 +801,7 @@ class TextAudioCallback:
             trainer.ema.restore(trainer.model)   # match _validate_epoch
             trainer.model.train()
 
-        # ── RANK 0 only: decode, evaluate, save ─────────────
-        if not _rank0():
-            return
+        # ── decode, evaluate, save (rank 0 only; enforced at function entry) ──
 
         if has_data and any(sampler_task_bits.values()):
             step = _global_step(trainer, epoch)

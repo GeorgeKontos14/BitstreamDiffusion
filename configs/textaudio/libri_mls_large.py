@@ -21,7 +21,7 @@ def get_config():
     cfg = config_dict.ConfigDict()
 
     cfg.framework = "continuous_score"
-    cfg.experiment = "full_textaudio"
+    cfg.experiment = "Cobit_630M_textaudio"
     cfg.device = "cuda"
 
     # ------------------------------------------------------------------
@@ -128,7 +128,7 @@ def get_config():
     # ------------------------------------------------------------------
     cfg.diffusion = config_dict.ConfigDict()
     cfg.diffusion.continuous = config_dict.ConfigDict()
-    cfg.diffusion.continuous.sigma_min = 0.002
+    cfg.diffusion.continuous.sigma_min = 0.01
     cfg.diffusion.continuous.sigma_max = 80.0
     cfg.diffusion.continuous.rho = 7.0
     cfg.diffusion.continuous.sigma_data = 0.5
@@ -151,7 +151,7 @@ def get_config():
     cfg.train.loss_weighting = "edm"
 
     cfg.train.batch_size = 512           # global; trainer shards batch//world_size (512/16 = 32/GPU)
-    cfg.train.epochs = 110               # ~2M steps at 512 over ~11M samples (~21.4K steps/epoch); total_steps governs
+    cfg.train.epochs = 110               # ~2M steps at 512 over ~11M samples (~21.8K steps/epoch); total_steps governs
     cfg.train.ema_decay = 0.9999
     cfg.train.sigma_sampling_strategy = "log-normal"
     cfg.train.self_condition_prob = 0.5
@@ -193,7 +193,7 @@ def get_config():
     cfg.train.textaudio = config_dict.ConfigDict()
     cfg.train.textaudio.enabled = True
     cfg.train.textaudio.run_on_sanity = True
-    cfg.train.textaudio.every_epochs = 10
+    cfg.train.textaudio.every_epochs = 5
     cfg.train.textaudio.split = 'val'
     cfg.train.textaudio.num_samples = 128
     cfg.train.textaudio.whisper_model = 'openai/whisper-medium'
@@ -259,9 +259,9 @@ def get_config():
     cfg.logging = config_dict.ConfigDict()
     cfg.logging.use_wandb = True
     cfg.logging.entity = None
-    cfg.logging.project = "textaudio_full"
+    cfg.logging.project = "cobit_630M_textaudio"
     cfg.logging.group = "full"
-    cfg.logging.mode = "online"
+    cfg.logging.mode = "offline"
     cfg.logging.watch_model = False
     cfg.logging.log_freq = 10
     cfg.logging.run_id = None

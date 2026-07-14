@@ -7,7 +7,11 @@ from ml_collections import config_dict
 
 from jiwer import wer, cer
 
+from scipy.linalg import sqrtm
+
 from typing import Any, Dict, List
+
+from transformers import AutoFeatureExtractor, AutoTokenizer, WavLMForXVector, WavLMModel, AutoModelForCausalLM
 
 # Task IDs
 UNCONDITIONAL = 0
@@ -116,12 +120,37 @@ class UTMOS:
         return score[0].item()
     
 class TextAudioEvaluator:
-    def __init__(self, whisper_model: str = 'openai/whisper-medium', sr=16_000, _dbg_func=None):
+    def __init__(
+            self,
+            whisper_model: str = 'openai/whisper-medium', 
+            sr=16_000,
+            speaker_extractor: str = 'microsoft/wavlm-base-plus-sv',
+            speech_extractor: str = 'microsoft/wavlm-large',
+            text_model: str = 'meta-llama/Llama-3.2-1B',
+            statistics_path: str = None,
+            partition: str = 'clean',
+            _dbg_func=None,
+            speaker_ref_path: str = 'datasets/tts/ref_speaker_embeddings.npz',
+        ):
         self._whisper_name = whisper_model
+        self._speaker_extractor_name = speaker_extractor
+        self._feature_extractor_name = speech_extractor
+        self._text_model_name = text_model
+        self._statistics_path = statistics_path
+        self._speaker_ref_path = speaker_ref_path
         self._sr = sr
         self._asr = None
+        self._speaker_extractor = None
+        self._speaker_model = None
+        self._feature_extractor = None
+        self._text_extractor = None
+        self._text_model = None
+        self.reference_statistics = None
+        self.partition = partition
         self._utmos = None
         self._dbg_func = _dbg_func
+
+        self._ref_speaker_embeddings = None
 
     def _dbg(self, msg: str):
         if self._dbg_func:
@@ -215,7 +244,119 @@ class TextAudioEvaluator:
         if not refs:
             return float('nan')
         return float(cer(refs, hyps))
+
+    def _ensure_speaker_extractor(self, device):
+        if self._speaker_extractor is None:
+            self._speaker_extractor  = AutoFeatureExtractor.from_pretrained(
+                self._speaker_extractor_name
+            )
+        if self._speaker_model is None:
+            self._speaker_model = WavLMForXVector.from_pretrained(
+                self._speaker_extractor_name
+            )
+            self._speaker_model.eval()
+        return self._speaker_extractor, self._speaker_model
+
+    def _ensure_ref_speaker_embeddings(self, device):
+        if self._ref_speaker_embeddings is None:
+            data = np.load(self._speaker_ref_path)
+            embeddings = data[f'{self.partition}_embeddings']
+            self._ref_speaker_embeddings = torch.from_numpy(embeddings).float()
+        return self._ref_speaker_embeddings.to(device)
     
+    def spksim(self, gen_wavs, device) -> float:
+        extractor, model = self._ensure_speaker_extractor(device)
+        ref_embeddings = self._ensure_ref_speaker_embeddings(device)
+        
+        gen_wavs = [np.asarray(wav, dtype=np.float32).flatten() for wav in gen_wavs]
+    
+        inputs = extractor(
+            gen_wavs, return_tensors='pt', padding=True, sampling_rate=self._sr
+        )
+        inputs = {k: v.to(device) for k,v in inputs.items()}
+
+        with torch.no_grad():
+            gen_embeddings = model(**inputs).embeddings
+        gen_embeddings = torch.nn.functional.normalize(gen_embeddings, dim=-1).cpu()
+        return (ref_embeddings*gen_embeddings).sum(dim=-1).mean().item()
+
+    def _ensure_feature_extractor(self, device):
+        if self._speaker_extractor is None:
+            self._speaker_extractor  = AutoFeatureExtractor.from_pretrained(
+                self._speaker_extractor_name
+            )
+        if self._feature_extractor is None:
+            self._feature_extractor = WavLMModel.from_pretrained(
+                self._feature_extractor_name
+            ).to(device)
+            self._feature_extractor.eval()
+        return self._speaker_extractor, self._feature_extractor
+    
+    def _ensure_refernce_statistics(self):
+        if self.reference_statistics is None:
+            stats = np.load(self._statistics_path)
+            self.reference_statistics = (stats[f'{self.partition}_mean'], stats[f'{self.partition}_cov'])
+        return self.reference_statistics
+
+    def fsd(self, wavs, device, chunk_size: int = 32) -> float:
+        extractor, model = self._ensure_feature_extractor(device)
+        ref_mean, ref_cov = self._ensure_refernce_statistics()
+
+        wavs = [np.asarray(wav, dtype=np.float32).flatten() for wav in wavs]
+
+        all_embs = []
+        for i in range(0, len(wavs), chunk_size):
+            chunk = wavs[i : i + chunk_size]
+            inputs = extractor(chunk, return_tensors='pt', padding=True, sampling_rate=self._sr)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                out = model(**inputs, output_hidden_states=True)
+            all_embs.append(out.hidden_states[6].mean(dim=1).cpu().float().numpy())
+        embedding = np.concatenate(all_embs, axis=0)
+
+        gen_mean = np.mean(embedding, axis=0)
+        gen_cov = np.cov(embedding, rowvar=False)
+
+        mean_diff = ref_mean - gen_mean
+        tr, _ = sqrtm(ref_cov @ gen_cov, disp=False)
+        if np.iscomplexobj(tr):
+            tr = tr.real
+        tr = np.trace(ref_cov + gen_cov - 2 * tr)
+        return mean_diff @ mean_diff + tr    
+
+    def _ensure_text_model(self, device):
+        if self._text_extractor is None:
+            self._text_extractor = AutoTokenizer.from_pretrained(self._text_model_name)
+            self._text_extractor.pad_token = self._text_extractor.eos_token
+        if self._text_model is None:
+            self._text_model = AutoModelForCausalLM.from_pretrained(
+                self._text_model_name, torch_dtype=torch.float16
+            ).to(device).eval()
+        return self._text_extractor, self._text_model
+
+    def gen_ppl(self,hyps,device) -> float:
+        extractor, model = self._ensure_text_model(device)
+        
+        inputs = extractor(hyps, return_tensors='pt', padding=True).to(model.device)
+        labels = inputs['input_ids'].clone()
+        labels[inputs['attention_mask'] == 0] = -100
+
+        with torch.no_grad():
+            logits = model(**inputs).logits
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+
+        loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
+        token_losses = loss_fn(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1)
+        ).view(shift_labels.size())
+        mask = shift_labels != -100
+        mean_loss_per_sample = (token_losses * mask).sum(dim=1) / mask.sum(dim=1)
+        perplexities = torch.exp(mean_loss_per_sample).tolist()
+
+        return sum(perplexities/len(perplexities))
+
     def evaluate_task_brief(
         self, task:str, gen_texts:List[str], ref_texts: List[str], gen_wavs, device
     ) -> Dict[str, float]:
@@ -242,3 +383,116 @@ class TextAudioEvaluator:
             metrics['CER'] = self.character_error_rate(gen_texts, transcriptions)
 
         return metrics, transcriptions
+
+    def evaluate_task_extensive(
+        self, task:str, gen_texts:List[str], ref_texts: List[str], gen_wavs, device
+    ) -> Dict[str, float]:
+        metrics = {}
+        transcriptions = None
+
+        if task == 'joint':
+            transcriptions = self.transcribe(gen_wavs, device)
+            metrics['Cross-Modal WER'] = self.word_error_rate(gen_texts, transcriptions)
+            metrics['Cross-Modal CER'] = self.character_error_rate(gen_texts, transcriptions)
+            metrics['UTMOS'] = self.utmos_score(gen_wavs)
+            metrics['GenPPL-text'] = self.gen_ppl(gen_texts, device)
+            metrics['GenPPL-speech'] = self.gen_ppl(transcriptions, device)
+            metrics['FSD'] = self.fsd(gen_wavs, device)
+        elif task == 'tts':
+            transcriptions = self.transcribe(gen_wavs, device)
+            metrics['ASR-WER'] = self.word_error_rate(ref_texts, transcriptions)
+            metrics['ASR-CER'] = self.character_error_rate(ref_texts, transcriptions)
+            metrics['UTMOS'] = self.utmos_score(gen_wavs)
+            metrics['SpkSim'] = self.spksim(gen_wavs, device)
+        elif task == 'stt':
+            metrics[f'{self.partition}-WER'], metrics[f'{self.partition}-CER'] = self.evaluate_stt(
+                ref_texts=ref_texts, transcriptions=transcriptions, device=device
+            )
+        elif task == 'cont':
+            transcriptions = self.transcribe(gen_wavs, device)
+            metrics['UTMOS'] = self.utmos_score(gen_wavs)
+            metrics['WER'] = self.word_error_rate(gen_texts, transcriptions)
+            metrics['CER'] = self.character_error_rate(gen_texts, transcriptions)
+            metrics['GenPPL-text'] = self.gen_ppl(gen_texts, device)
+            metrics['GenPPL-speech'] = self.gen_ppl(transcriptions, device)
+            metrics['FSD'] = self.fsd(gen_wavs, device)
+            # metrics['LLM-as-a-Judge'] = 0
+
+        return metrics, transcriptions
+ 
+    def evaluate_stt(self, ref_texts: list[str], gen_wavs=None, transcriptions: list[str] = None, device='cpu'):
+        if not transcriptions:
+            transcriptions = self.transcribe(gen_wavs, device)
+        wer = self.word_error_rate(ref_texts, transcriptions)
+        cer = self.character_error_rate(ref_texts, transcriptions)
+        return wer, cer
+
+SALMON_JUDGES = [
+    "nvidia/speakerverification_en_titanet_large", 
+    "ALM/hubert-large-audioset",
+    "ALM/wav2vec2-large-audioset"
+]
+
+SALMON_JUDGE_PER_TASK = {
+    'sentiment_consistency': "nvidia/speakerverification_en_titanet_large",
+    'speaker_consistency': "nvidia/speakerverification_en_titanet_large",
+    'gender_consistency': "nvidia/speakerverification_en_titanet_large",
+    'bg_domain_consistency': "ALM/hubert-large-audioset",
+    'bg_all_consistency': "ALM/hubert-large-audioset",
+    'rir_consistency': "ALM/wav2vec2-large-audioset"
+}
+
+class SALMONEvaluator:
+    def __init__(
+            self, 
+            sr: int = 16_000, 
+            max_len: float = 5.0,
+            ref_dir: str = 'datasets/continuation',
+            _dbg_func=None
+        ):
+        self._sr = sr
+        self._max_len = max_len
+        self._dbg_func = _dbg_func
+        self.judges = None
+        self.embeddings_per_task = None
+        self.ref_dir = ref_dir
+
+    def _dbg(self, msg: str):
+        if self._dbg_func:
+            self._dbg_func(msg)
+        else:
+            print(msg)
+
+    def _ensure_judges(self, device):
+        from utils.judge_models import JudgeModel
+        if not self.judges:
+            self.judges = {}
+            for judge_name in SALMON_JUDGES:
+                self.judges[judge_name] = JudgeModel(judge_name, self._sr, device, self._max_len)
+        return self.judges
+    
+    def _ensure_embeddings(self, device):
+        if not self.embeddings_per_task:
+            self.embeddings_per_task = {}
+            for task in SALMON_JUDGE_PER_TASK.keys():
+                embeddings_path = f'{self.ref_dir}/judge_embeddings_{task}.npz'
+                embeddings = np.load(embeddings_path)
+                self.embeddings_per_task[task] = {
+                    'pos': torch.from_numpy(embeddings['positive']).to(device),
+                    'neg': torch.from_numpy(embeddings['negative']).to(device)
+                }
+        return self.embeddings_per_task
+    
+    def evaluate_SALMON(self, gen_wavs_per_task: dict, device):
+        metrics = {}
+
+        judges = self._ensure_judges(device)
+        ref_embeddings = self._ensure_embeddings(device)
+
+        for task, judge in SALMON_JUDGE_PER_TASK.items():
+            gen_embeddings = judges[judge].embed_batch(gen_wavs_per_task[task])
+            metrics[task] = judges[judge].score(
+                gen_embeddings, ref_embeddings[task]['pos'], ref_embeddings[task]['neg']
+            )
+
+        return metrics
