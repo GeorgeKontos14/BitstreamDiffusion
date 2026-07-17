@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from ml_collections import config_dict
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 
@@ -39,6 +39,11 @@ def _build_token_to_bits_table(vocab_size: int, bits_per_token: int) -> torch.Te
     ids = torch.arange(vocab_size, dtype=torch.long)
     shifts = torch.arange(bits_per_token-1, -1, -1, dtype=torch.long)
     return (ids.unsqueeze(1) >> shifts) & 1
+
+def _val_test_geometry_suffix(config: config_dict.ConfigDict) -> str:
+    seq_len_tokens = int(getattr(config.data, 'seq_len_tokens', 1000))
+    return '' if seq_len_tokens == 1000 else f'_{seq_len_tokens}'
+
 
 def _ddp_is_on() -> bool:
     return dist.is_available() and dist.is_initialized()
@@ -169,15 +174,17 @@ class TextAudioDataset(_PackedTokenCacheDataset):
         root = Path(getattr(config.data, 'root', 'datasets/'))
 
         if split == 'train':
-            cache_path = root / 'libri' / 'cache_libri_train.uint32'
-            meta_path = root / 'libri' / 'cache_libri_train.meta.json'
+            dataset_name = str(config.data.dataset)
+            stem = f'{dataset_name}/cache_{dataset_name}_train'
+            cache_path = root / f'{stem}.uint32'
+            meta_path = root / f'{stem}.meta.json'
         elif split == 'val':
-            stem = f'validation/cache_val_{self.TASK}'
+            stem = f'validation/cache_val_{self.TASK}{_val_test_geometry_suffix(config)}'
             cache_path = root / f'{stem}.uint32'
             meta_path = root / f'{stem}.meta.json'
         else:
             test_partition = str(getattr(config.data, 'partition', 'clean'))
-            stem = f'test/cache_test_{test_partition}_{self.TASK}'
+            stem = f'test/cache_test_{test_partition}_{self.TASK}{_val_test_geometry_suffix(config)}'
             cache_path = root / f'{stem}.uint32'
             meta_path = root / f'{stem}.meta.json'
 
@@ -193,40 +200,21 @@ class TextAudioDataset(_PackedTokenCacheDataset):
         )
 
 
-class MLSTextAudioDataset(_PackedTokenCacheDataset):
-    """Additional English-MLS training data for large-scale runs -- merged
-    into the training set via ConcatDataset (see get_dataloaders). Only a
-    'train' split exists; MLS isn't used for val/test."""
-
-    def __init__(self, config: config_dict.ConfigDict, *, split: str):
-        if split != 'train':
-            raise ValueError(
-                f"MLSTextAudioDataset has no split={split!r}; only 'train' exists."
-            )
-        root = Path(getattr(config.data, 'root', 'datasets/'))
-        stem = 'mls/cache_mls_train'
-
-        super().__init__(
-            config,
-            cache_path=root / f'{stem}.uint32',
-            meta_path=root / f'{stem}.meta.json',
-            expected_cache_format='packed_multimodal_blocks',
-            expected_seq_len_tokens=int(getattr(config.data, 'seq_len_tokens', 1000)),
-            log_tag='mls',
-        )
-        self.split = split
-
-
 class TextAudioTTSDataset(_PackedTokenCacheDataset):
     TASK = 'tts'
 
     def __init__(self, config: config_dict.ConfigDict, *, split: str):
-        if split != 'val':
+        if split not in {'val', 'test'}:
             raise ValueError(
-                f"TextAudioTTSDataset has no split={split!r}; only 'val' exists."
+                f"TextAudioTTSDataset has no split={split!r}; only 'val'/'test' exist."
             )
         root = Path(getattr(config.data, 'root', 'datasets/'))
-        stem = f'validation/cache_val_{self.TASK}'
+
+        if split == 'val':
+            stem = f'validation/cache_val_{self.TASK}{_val_test_geometry_suffix(config)}'
+        else:
+            test_partition = str(getattr(config.data, 'partition', 'clean'))
+            stem = f'test/cache_test_{test_partition}_{self.TASK}{_val_test_geometry_suffix(config)}'
 
         text_seq_len = int(getattr(config.data, 'text_seq_len', 168))
         speaker_seq_len = int(getattr(config.data, 'speaker_seq_len', 32))
@@ -246,12 +234,17 @@ class TextAudioContinuationDataset(_PackedTokenCacheDataset):
     TASK = 'cont'
 
     def __init__(self, config: config_dict.ConfigDict, *, split: str):
-        if split != 'val':
+        if split not in {'val', 'test'}:
             raise ValueError(
-                f"TextAudioContinuationDataset has no split={split!r}; only 'val' exists."
+                f"TextAudioContinuationDataset has no split={split!r}; only 'val'/'test' exist."
             )
         root = Path(getattr(config.data, 'root', 'datasets/'))
-        stem = f'validation/cache_val_{self.TASK}'
+
+        if split == 'val':
+            stem = f'validation/cache_val_{self.TASK}'
+        else:
+            test_partition = str(getattr(config.data, 'partition', 'clean'))
+            stem = f'test/cache_test_{test_partition}_{self.TASK}'
 
         super().__init__(
             config,
@@ -276,8 +269,6 @@ def get_dataloaders(
     batch = int(batch_size or config.train.batch_size)
 
     train_ds = TextAudioDataset(config, split='train')
-    if bool(getattr(config.data, 'use_mls_train', False)):
-        train_ds = ConcatDataset([train_ds, MLSTextAudioDataset(config, split='train')])
     val_ds = TextAudioDataset(config, split='val')
     test_ds = TextAudioDataset(config, split='test')
 

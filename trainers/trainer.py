@@ -1709,20 +1709,34 @@ class Trainer:
             self.opt.zero_grad(set_to_none=True)
 
             if self.use_scaler:
+                # GradScaler already skips opt.step() internally (and adjusts its
+                # scale factor) if the unscaled gradients contain inf/nan -- this
+                # branch only runs for amp_dtype==float16, which is why it has its
+                # own built-in protection already.
                 self.scaler.scale(loss).backward()
                 if self.grad_clip > 0:
                     self.scaler.unscale_(self.opt)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.scaler.step(self.opt)
                 self.scaler.update()
+                self.lr_sched.step()
+                self.ema.update(self.model)
             else:
                 loss.backward()
+                skip_step = False
                 if self.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                self.opt.step()
-
-            self.lr_sched.step()
-            self.ema.update(self.model)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    if not torch.isfinite(grad_norm):
+                        skip_step = True
+                        if self.is_master:
+                            print(
+                                f"[warn] step {self.global_step}: non-finite grad_norm="
+                                f"{grad_norm.item()}, skipping optimizer step"
+                            )
+                if not skip_step:
+                    self.opt.step()
+                    self.lr_sched.step()
+                    self.ema.update(self.model)
 
         # ------------------------------------------------------------------
         # Entropy buffer update
@@ -2100,11 +2114,11 @@ class Trainer:
                         }
                     )
 
-                # Run callbacks (some may request running on all ranks)
-                self._run_callbacks("on_epoch_end", epoch)
-
                 if self.is_master:
                     self._save_ckpt(epoch, avg_val_loss)
+
+                # Run callbacks (some may request running on all ranks)
+                self._run_callbacks("on_epoch_end", epoch)
 
                 # Flush TB buffers and sync staged logs -> run_dir (master only)
                 if self.is_master and self.tb is not None:

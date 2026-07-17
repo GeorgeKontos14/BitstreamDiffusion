@@ -17,11 +17,11 @@ def _is_distributed():
 def _setup_ddp():
     """Initialize DDP process group if distributed."""
     if _is_distributed():
-        dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=4)) # Callback safety
         rank = int(os.environ["RANK"])
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=4)) # Callback safety
         # Only print setup info on master or for debugging
         if rank == 0:
             print(f"🚀 DDP Initialized: Global Rank {rank}, World Size {world_size}")

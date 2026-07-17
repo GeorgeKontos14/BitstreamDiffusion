@@ -307,11 +307,43 @@ class TextAudioCallback:
         self._ddim_sampler = None
         self._evaluator = None
         self._last_run_key = None
+        self._tts_ref_audio_cache: Optional[list] = None
+        self._stt_ref_audio_cache: Optional[list] = None
 
     def _ensure_evaluator(self, r: _ResolvedTextAudio) -> None:
         if self._evaluator is not None:
             return
         self._evaluator = TextAudioEvaluator(r.whisper_model, r.sample_rate, _dbg)
+
+    def _ensure_tts_ref_audio_cache(self, data_cfg) -> list:
+        if self._tts_ref_audio_cache is not None:
+            return self._tts_ref_audio_cache
+        root = Path(str(getattr(data_cfg, 'root', 'datasets/'))) if data_cfg is not None else Path('datasets/')
+        path = root / 'validation' / 'cache_val_tts_632.ref_audio.npz'
+        if not path.exists():
+            _dbg(f"[tts ref-audio] {path} not found -- run build_tts_val_ref_audio.py; "
+                 f"tts reference audio will be skipped for now")
+            self._tts_ref_audio_cache = []
+            return self._tts_ref_audio_cache
+        data = np.load(path, allow_pickle=True)
+        self._tts_ref_audio_cache = list(data['wavs'])
+        _dbg(f"[tts ref-audio] loaded {len(self._tts_ref_audio_cache):,} reference waveforms from {path}")
+        return self._tts_ref_audio_cache
+
+    def _ensure_stt_ref_audio_cache(self, data_cfg) -> list:
+        if self._stt_ref_audio_cache is not None:
+            return self._stt_ref_audio_cache
+        root = Path(str(getattr(data_cfg, 'root', 'datasets/'))) if data_cfg is not None else Path('datasets/')
+        path = root / 'validation' / 'cache_val_asr_632.ref_audio.npz'
+        if not path.exists():
+            _dbg(f"[stt ref-audio] {path} not found -- run build_asr_val_ref_audio.py; "
+                 f"falling back to codec-decoded reference audio for now")
+            self._stt_ref_audio_cache = []
+            return self._stt_ref_audio_cache
+        data = np.load(path, allow_pickle=True)
+        self._stt_ref_audio_cache = list(data['wavs'])
+        _dbg(f"[stt ref-audio] loaded {len(self._stt_ref_audio_cache):,} reference waveforms from {path}")
+        return self._stt_ref_audio_cache
 
     def _should_run(self, epoch: int, r: _ResolvedTextAudio) -> bool:
         if not r.enabled:
@@ -668,6 +700,8 @@ class TextAudioCallback:
             'samplers': {},
         }
 
+        written_ref_tasks: set = set()
+
         for sampler_tag, task_results in all_results.items():
             sampler_entry: Dict[str, dict] = {'tasks': {}}
 
@@ -682,6 +716,13 @@ class TextAudioCallback:
                 transcriptions = res.get('transcriptions')
                 metrics = res.get('metrics', {})
 
+                if task in ('tts', 'stt') and task not in written_ref_tasks and ref_wavs is not None:
+                    ref_dir = save_dir / task
+                    ref_dir.mkdir(parents=True, exist_ok=True)
+                    for i in range(min(r.num_samples, len(ref_wavs))):
+                        _write_wav(ref_dir / f'ref_{i:04d}.wav', ref_wavs[i], r.sample_rate)
+                    written_ref_tasks.add(task)
+
                 samples = []
                 n = r.num_samples
 
@@ -691,7 +732,7 @@ class TextAudioCallback:
                     if task in ('joint', 'stt', 'cont'):
                         sample['gen_text'] = gen_texts[i]
                     if task in ('tts', 'stt'):
-                        sample['ref_text'] = ref_texts[i]
+                        sample['ref_text'] = ref_texts[i] if i < len(ref_texts) else None
 
                     if task in ('joint', 'tts', 'cont'):
                         wav_rel = f'{sampler_tag}/{task}/gen_{i:04d}.wav'
@@ -699,9 +740,9 @@ class TextAudioCallback:
                         sample['gen_wav'] = wav_rel
 
                     if task in ('tts', 'stt'):
-                        wav_rel = f'{sampler_tag}/{task}/ref_{i:04d}.wav'
-                        _write_wav(save_dir / wav_rel, ref_wavs[i], r.sample_rate)
-                        sample['ref_wav'] = wav_rel
+                        sample['ref_wav'] = (
+                            f'{task}/ref_{i:04d}.wav' if ref_wavs is not None and i < len(ref_wavs) else None
+                        )
 
                     if task in ('joint', 'tts'):
                         sample['whisper'] = transcriptions[i]
@@ -808,6 +849,29 @@ class TextAudioCallback:
             self._ensure_evaluator(r)
             all_results: Dict[str, Dict[str, dict]] = {}  # {sampler_tag: {task: result}}
 
+            ref_texts_by_task: Dict[str, list] = {}
+            ref_wavs_by_task: Dict[str, Optional[list]] = {}
+            for task in ("tts", "stt"):
+                if task not in task_x_full:
+                    continue
+                ref_token_ids = self._bits_to_token_ids(
+                    (task_x_full[task] > 0.5).to(torch.long), r,
+                )
+                ref_texts_by_task[task] = self._decode_texts(trainer, ref_token_ids, r)
+                if task == "stt":
+
+                    stt_cache = self._ensure_stt_ref_audio_cache(getattr(trainer.cfg, "data", None))
+                    n_stt = task_x_full[task].size(0)
+                    if stt_cache and n_stt <= len(stt_cache):
+                        ref_wavs_by_task[task] = list(stt_cache[:n_stt])
+                    else:
+                        ref_wavs_by_task[task] = self._decode_speech_wavs(trainer, ref_token_ids, r)
+                else:
+
+                    cache = self._ensure_tts_ref_audio_cache(getattr(trainer.cfg, "data", None))
+                    n = task_x_full[task].size(0)
+                    ref_wavs_by_task[task] = list(cache[:n]) if cache else None
+
             for sampler_tag, task_bits in sampler_task_bits.items():
                 sampler_results: Dict[str, dict] = {}
 
@@ -822,14 +886,8 @@ class TextAudioCallback:
                         gen_texts  = self._decode_texts(trainer, token_ids, r) if needs_gen_text else []
                         gen_wavs   = self._decode_speech_wavs(trainer, token_ids, r) if needs_gen_wav else []
 
-                        ref_texts = []
-                        ref_wavs  = None
-                        if needs_ref:
-                            ref_token_ids = self._bits_to_token_ids(
-                                (task_x_full[task] > 0.5).to(torch.long), r,
-                            )
-                            ref_texts = self._decode_texts(trainer, ref_token_ids, r)
-                            ref_wavs  = self._decode_speech_wavs(trainer, ref_token_ids, r)
+                        ref_texts = ref_texts_by_task.get(task, []) if needs_ref else []
+                        ref_wavs  = ref_wavs_by_task.get(task) if needs_ref else None
 
                         metrics, transcriptions = self._evaluator.evaluate_task_brief(
                             task, gen_texts, ref_texts, gen_wavs, trainer.device,
