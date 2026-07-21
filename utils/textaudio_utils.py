@@ -1,4 +1,5 @@
 import re
+from pathlib import Path
 
 import numpy as np
 
@@ -89,6 +90,43 @@ def _safe_decode(enc, token_ids):
             parts.append(b'<unk>')
     return b"".join(parts).decode("utf-8", errors="replace")
 
+def _write_wav(path, arr, sr: int) -> None:
+    import wave
+    arr = np.asarray(arr, dtype=np.float32).flatten()
+    pcm = (arr * 32767).astype(np.int16)
+    with wave.open(str(path), 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sr))
+        wf.writeframes(pcm.tobytes())
+
+def _read_wav(path) -> np.ndarray:
+    import wave
+    with wave.open(str(path), 'rb') as wf:
+        assert wf.getsampwidth() == 2, f"{path}: expected 16-bit PCM"
+        pcm = wf.readframes(wf.getnframes())
+    arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32767.0
+    return arr
+
+def load_ref_audio_cache(root, split: str, task: str, partition: str = 'clean', dbg=None) -> list:
+    assert task in ('tts', 'asr'), f"load_ref_audio_cache: unknown task={task!r}"
+    root = Path(str(root)) if not isinstance(root, Path) else root
+    if split == 'val':
+        path = root / 'validation' / f'cache_val_{task}_632.ref_audio.npz'
+    else:
+        path = root / 'test' / f'cache_test_{partition}_{task}_632.ref_audio.npz'
+
+    if not path.exists():
+        msg = f"[{task} ref-audio] {path} not found -- reference audio will be skipped for now"
+        if dbg:
+            dbg(msg)
+        else:
+            print(msg)
+        return []
+
+    data = np.load(path, allow_pickle=True)
+    return list(data['wavs'])
+
 # Code taken from https://github.com/Takaaki-Saeki/DiscreteSpeechMetrics
 # Pasted to bypass import issues
 class UTMOS:
@@ -131,6 +169,7 @@ class TextAudioEvaluator:
             partition: str = 'clean',
             _dbg_func=None,
             speaker_ref_path: str = 'datasets/tts/ref_speaker_embeddings.npz',
+            asr_num_workers: int = 4,
         ):
         self._whisper_name = whisper_model
         self._speaker_extractor_name = speaker_extractor
@@ -138,6 +177,7 @@ class TextAudioEvaluator:
         self._text_model_name = text_model
         self._statistics_path = statistics_path
         self._speaker_ref_path = speaker_ref_path
+        self._asr_num_workers = int(asr_num_workers)
         self._sr = sr
         self._asr = None
         self._speaker_extractor = None
@@ -193,7 +233,7 @@ class TextAudioEvaluator:
         results = [""]*len(wavs)
         if inputs:
             try:
-                preds = asr(inputs, batch_size=min(64, len(inputs)))
+                preds = asr(inputs, batch_size=min(64, len(inputs)), num_workers=self._asr_num_workers)
                 for idx, pred in zip(valid_idx, preds):
                     results[idx] = pred['text'].strip()
             except Exception as e:
@@ -405,9 +445,8 @@ class TextAudioEvaluator:
             metrics['UTMOS'] = self.utmos_score(gen_wavs)
             metrics['SpkSim'] = self.spksim(gen_wavs, device)
         elif task == 'stt':
-            metrics[f'{self.partition}-WER'], metrics[f'{self.partition}-CER'] = self.evaluate_stt(
-                ref_texts=ref_texts, transcriptions=transcriptions, device=device
-            )
+            metrics[f'{self.partition}-WER'] = self.word_error_rate(ref_texts, gen_texts)
+            metrics[f'{self.partition}-CER'] = self.character_error_rate(ref_texts, gen_texts)
         elif task == 'cont':
             transcriptions = self.transcribe(gen_wavs, device)
             metrics['UTMOS'] = self.utmos_score(gen_wavs)

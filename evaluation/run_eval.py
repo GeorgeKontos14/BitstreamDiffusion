@@ -45,6 +45,7 @@ from evaluation.evaluation_drivers.fid_sweep import evaluate_fid_sweep
 from evaluation.evaluation_drivers.fid import evaluate_fid
 from evaluation.evaluation_drivers.mauve import evaluate_mauve
 from evaluation.evaluation_drivers.generate_samples import evaluate_generate_samples
+from evaluation.evaluation_drivers.textaudio_generate import evaluate_textaudio_generate
 
 
 # -----------------------------------------------------------------------------
@@ -56,7 +57,7 @@ def main():
 
     ap.add_argument(
         "--metrics", nargs="+", default=["bpc"],
-        choices=["bpc", "bpd", "fid", "fid_sweep", "vlb", "external_ppl", "external_bpc", "external_bpt", "mauve", "generate_samples"],
+        choices=["bpc", "bpd", "fid", "fid_sweep", "vlb", "external_ppl", "external_bpc", "external_bpt", "mauve", "generate_samples", "textaudio_generate"],
         help="Which metrics to compute",
     )
 
@@ -287,6 +288,9 @@ def main():
         evaluate_generate_samples(
             args, cfg, model, ema, use_ema, test_loader, device, rank0, ddp_active, run_meta, is_text_dataset
         )
+
+    if "textaudio_generate" in args.metrics:
+        evaluate_textaudio_generate(args, cfg, model, device, rank0, ddp_active, dist_info)
 
     # Finalize writes
     barrier()

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import time
-import wave
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +22,7 @@ try:
 except Exception:
     dist = None
 
-from utils.textaudio_utils import _fixed_mask, _safe_decode, TextAudioEvaluator
+from utils.textaudio_utils import _fixed_mask, _safe_decode, TextAudioEvaluator, _write_wav, load_ref_audio_cache
 from utils.textaudio_report import build_textaudio_report
 from utils.model_utils import unwrap_model
 
@@ -69,19 +68,6 @@ def _global_step(trainer, epoch: int) -> int:
         return int(epoch)
 
 # -----------------------------------------------------------------------------
-# Writing to disk
-# -----------------------------------------------------------------------------
-
-def _write_wav(path, arr, sr: int) -> None:
-    arr = np.asarray(arr, dtype=np.float32).flatten()
-    pcm = (arr*32767).astype(np.int16)
-    with wave.open(str(path), 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(int(sr))
-        wf.writeframes(pcm.tobytes())
-    
-# -----------------------------------------------------------------------------
 # Config resolution
 # -----------------------------------------------------------------------------
 @dataclass
@@ -92,7 +78,9 @@ class _SamplerSpec:
     target_nfe: int
     actual_nfe: int
     stochastic_enabled: bool
-    s_churn: Optional[float]
+    s_churn: Optional[float]  # extract from config
+    gamma: Optional[float]    # report
+    guidance_scale: float
 
 
 @dataclass
@@ -133,7 +121,7 @@ def _build_sampler_specs(cfg: Any, c: Any) -> List[_SamplerSpec]:
     """
     Expands cfg.train.textaudio.sampling_sweep.specs (mirrors
     cfg.evaluation.sampling_sweep.specs, see configs/owt/eval_*.py) into one
-    _SamplerSpec per (target_nfe x s_churn) combination.
+    _SamplerSpec per (target_nfe x s_churn x guidance_scale) combination.
     """
     from evaluation.nfe import steps_for_target_nfe
 
@@ -145,7 +133,8 @@ def _build_sampler_specs(cfg: Any, c: Any) -> List[_SamplerSpec]:
     if not raw_specs:
         raise ValueError(
             "cfg.train.textaudio.sampling_sweep.specs must define at least one spec "
-            "(sampler_name + target_nfes, optionally stochastic_enabled + s_churns)."
+            "(sampler_name + target_nfes, optionally stochastic_enabled + s_churns, "
+            "optionally guidance_scales)."
         )
 
     specs: List[_SamplerSpec] = []
@@ -165,6 +154,10 @@ def _build_sampler_specs(cfg: Any, c: Any) -> List[_SamplerSpec]:
         else:
             s_churns = [None]
 
+        guidance_scales = [float(v) for v in getattr(base, 'guidance_scales', [0.0])]
+        if not guidance_scales:
+            guidance_scales = [0.0]
+
         for target_nfe in target_nfes:
             num_steps, actual_nfe = steps_for_target_nfe(
                 framework=framework,
@@ -175,23 +168,32 @@ def _build_sampler_specs(cfg: Any, c: Any) -> List[_SamplerSpec]:
                 return_probs=True,
             )
             for s_churn in s_churns:
-                tag = f"{sampler_name}_nfe{target_nfe}"
-                if stochastic_enabled:
-                    tag += f"_stoch-ch{s_churn:g}"
+                gamma = (
+                    min(float(s_churn) / float(num_steps), math.sqrt(2.0) - 1.0)
+                    if (stochastic_enabled and num_steps > 0) else None
+                )
+                for guidance_scale in guidance_scales:
+                    tag = f"{sampler_name}_nfe{target_nfe}"
+                    if stochastic_enabled:
+                        tag += f"_stoch-g{gamma:.4g}"
+                    if guidance_scale > 0.0:
+                        tag += f"_gs{guidance_scale:g}"
 
-                if tag in seen_tags:
-                    raise ValueError(f"Duplicate textaudio sampling spec tag: {tag!r}")
-                seen_tags.add(tag)
+                    if tag in seen_tags:
+                        raise ValueError(f"Duplicate textaudio sampling spec tag: {tag!r}")
+                    seen_tags.add(tag)
 
-                specs.append(_SamplerSpec(
-                    tag=tag,
-                    sampler_name=sampler_name,
-                    num_steps=num_steps,
-                    target_nfe=target_nfe,
-                    actual_nfe=actual_nfe,
-                    stochastic_enabled=stochastic_enabled,
-                    s_churn=s_churn,
-                ))
+                    specs.append(_SamplerSpec(
+                        tag=tag,
+                        sampler_name=sampler_name,
+                        num_steps=num_steps,
+                        target_nfe=target_nfe,
+                        actual_nfe=actual_nfe,
+                        stochastic_enabled=stochastic_enabled,
+                        s_churn=s_churn,
+                        gamma=gamma,
+                        guidance_scale=guidance_scale,
+                    ))
 
     return specs
 
@@ -318,31 +320,15 @@ class TextAudioCallback:
     def _ensure_tts_ref_audio_cache(self, data_cfg) -> list:
         if self._tts_ref_audio_cache is not None:
             return self._tts_ref_audio_cache
-        root = Path(str(getattr(data_cfg, 'root', 'datasets/'))) if data_cfg is not None else Path('datasets/')
-        path = root / 'validation' / 'cache_val_tts_632.ref_audio.npz'
-        if not path.exists():
-            _dbg(f"[tts ref-audio] {path} not found -- run build_tts_val_ref_audio.py; "
-                 f"tts reference audio will be skipped for now")
-            self._tts_ref_audio_cache = []
-            return self._tts_ref_audio_cache
-        data = np.load(path, allow_pickle=True)
-        self._tts_ref_audio_cache = list(data['wavs'])
-        _dbg(f"[tts ref-audio] loaded {len(self._tts_ref_audio_cache):,} reference waveforms from {path}")
+        root = getattr(data_cfg, 'root', 'datasets/') if data_cfg is not None else 'datasets/'
+        self._tts_ref_audio_cache = load_ref_audio_cache(root, split='val', task='tts', dbg=_dbg)
         return self._tts_ref_audio_cache
 
     def _ensure_stt_ref_audio_cache(self, data_cfg) -> list:
         if self._stt_ref_audio_cache is not None:
             return self._stt_ref_audio_cache
-        root = Path(str(getattr(data_cfg, 'root', 'datasets/'))) if data_cfg is not None else Path('datasets/')
-        path = root / 'validation' / 'cache_val_asr_632.ref_audio.npz'
-        if not path.exists():
-            _dbg(f"[stt ref-audio] {path} not found -- run build_asr_val_ref_audio.py; "
-                 f"falling back to codec-decoded reference audio for now")
-            self._stt_ref_audio_cache = []
-            return self._stt_ref_audio_cache
-        data = np.load(path, allow_pickle=True)
-        self._stt_ref_audio_cache = list(data['wavs'])
-        _dbg(f"[stt ref-audio] loaded {len(self._stt_ref_audio_cache):,} reference waveforms from {path}")
+        root = getattr(data_cfg, 'root', 'datasets/') if data_cfg is not None else 'datasets/'
+        self._stt_ref_audio_cache = load_ref_audio_cache(root, split='val', task='asr', dbg=_dbg)
         return self._stt_ref_audio_cache
 
     def _should_run(self, epoch: int, r: _ResolvedTextAudio) -> bool:
@@ -476,7 +462,7 @@ class TextAudioCallback:
         cond_kwargs = dict(
             conditioning_prefix_full=x_full,
             cond_prefix_mask=cond_mask,
-            guidance_scale=0.0
+            guidance_scale=spec.guidance_scale,
         )
 
         with self._stochastic_cfg_override(stoch_overrides):
@@ -646,11 +632,15 @@ class TextAudioCallback:
                 _dbg(f'W&B table log failed {e}')
 
     def _save_to_disk(
-        self, trainer, all_results: Dict[str, Dict[str, dict]], r: _ResolvedTextAudio, step: int, epoch: int
+        self, trainer, all_results: Dict[str, Dict[str, dict]], r: _ResolvedTextAudio, step: int, epoch: int,
+        save_dir_override: Optional[Path] = None,
     ) -> None:
-        run_dir = Path(str(getattr(trainer, 'run_dir', 'runs/default')))
-        base_dir = run_dir / 'textaudio'
-        save_dir = base_dir / f'step_{step:09d}'
+        if save_dir_override is not None:
+            save_dir = Path(save_dir_override)
+        else:
+            run_dir = Path(str(getattr(trainer, 'run_dir', 'runs/default')))
+            base_dir = run_dir / 'textaudio'
+            save_dir = base_dir / f'step_{step:09d}'
         save_dir.mkdir(parents=True, exist_ok=True)
 
         data_cfg = getattr(self.cfg, 'data', None)
@@ -690,8 +680,9 @@ class TextAudioCallback:
                         'target_nfe': spec.target_nfe,
                         'actual_nfe': spec.actual_nfe,
                         'stochastic_enabled': spec.stochastic_enabled,
-                        's_churn': spec.s_churn,
+                        'gamma': spec.gamma,
                         'terminal_sigma': r.terminal_sigma,
+                        'guidance_scale': spec.guidance_scale,
                     }
                     for spec in r.samplers
                 ],
@@ -773,7 +764,7 @@ class TextAudioCallback:
 
     @torch.compiler.disable
     @torch.no_grad()
-    def on_epoch_end(self, trainer: Any, epoch: int) -> None:
+    def on_epoch_end(self, trainer: Any, epoch: int, save_dir_override: Optional[Path] = None) -> None:
         r = _resolve_cfg(self.cfg)
         
         if not self._should_run(epoch, r):
@@ -807,10 +798,22 @@ class TextAudioCallback:
                 torch.cuda.manual_seed_all(r.seed)
 
             amp_dtype = getattr(trainer, "amp_dtype", torch.float16)
-            sampler_tags = [spec.tag for spec in r.samplers]
 
             with autocast(enabled=r.use_amp, dtype=amp_dtype):
                 for task_id, task in enumerate(TASKS):
+                    if task == 'joint':
+                        # Skip joint (unconditional) generation for guided samplers
+                        specs_for_task = [s for s in r.samplers if s.guidance_scale <= 0.0]
+                        if not specs_for_task:
+                            if _rank0():
+                                _dbg(
+                                    "Skipping joint (unconditional) generation entirely: every "
+                                    "sampler in this sweep has guidance_scale>0."
+                                )
+                            continue
+                    else:
+                        specs_for_task = r.samplers
+
                     x_full = self._sample_real_data_for_task(trainer, B, r.split, task)
                     if x_full is None:
                         if _rank0():
@@ -824,11 +827,11 @@ class TextAudioCallback:
                     if _rank0():
                         _dbg(
                             f"START epoch={epoch} split={r.split} task={task} "
-                            f"B={task_B} samplers={sampler_tags} "
+                            f"B={task_B} samplers={[s.tag for s in specs_for_task]} "
                             f"sigma={r.terminal_sigma}"
                         )
 
-                    for spec in r.samplers:
+                    for spec in specs_for_task:
                         if _rank0():
                             _dbg(f"  {r.split}_{task} [{spec.tag}]: generating {task_B} samples (steps={spec.num_steps})")
                         try:
@@ -913,7 +916,7 @@ class TextAudioCallback:
 
             if all_results:
                 try:
-                    self._save_to_disk(trainer, all_results, r, step, epoch)
+                    self._save_to_disk(trainer, all_results, r, step, epoch, save_dir_override=save_dir_override)
                 except Exception as e:
                     _dbg(f"Local save failed: {e}")
 

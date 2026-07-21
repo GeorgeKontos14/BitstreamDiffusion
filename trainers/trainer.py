@@ -1341,8 +1341,7 @@ class Trainer:
             self._set_rng_state(ckpt["rng_state"])
 
         self.global_step = ckpt.get("global_step", 0)
-        epoch_complete = ckpt.get("epoch_complete", False)
-        start_epoch = (ckpt.get("epoch", -1) + 1) if epoch_complete else ckpt.get("epoch", 0)
+        start_epoch = ckpt.get("epoch", -1) + 1
         self.best_metric = ckpt.get("best_metric", self.best_metric)
         self.best_ckpts = ckpt.get("best_ckpts", self.best_ckpts)
         if self.is_master:
@@ -1980,6 +1979,8 @@ class Trainer:
         # Track interval ckpts for optional pruning (only interval ckpts)
         self._interval_ckpt_paths.append(path.name)
 
+        self._maybe_save_entropy_snapshot()
+
         keep_last = self.ckpt_interval_keep_last  # None => keep all
         if keep_last is not None and keep_last > 0:
             while len(self._interval_ckpt_paths) > keep_last:
@@ -1993,6 +1994,24 @@ class Trainer:
         while int(self._next_interval_ckpt_step) <= int(self.global_step):
             self._next_interval_ckpt_step += int(self.ckpt_interval_every_steps)
 
+    def _maybe_save_entropy_snapshot(self) -> None:
+        """
+        Save entropy snapshot at specific steps to allow for offline generation
+        with the entropic sampler. 
+        """
+        if self.cfg.framework != "continuous_score":
+            return
+        if not getattr(self, "_entropy_ready", False):
+            return
+
+        snap_dir = self.run_dir / "entropy_snapshots" / f"step_{int(self.global_step):09d}"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+
+        torch.save(self._entropy_pdf.detach().cpu(), snap_dir / "entropy_pdf.pt")
+        torch.save(self._entropy_cdf.detach().cpu(), snap_dir / "entropy_cdf.pt")
+        torch.save(self._entropy_sigmas.detach().cpu(), snap_dir / "entropy_sigmas.pt")
+        if self._entropy_edges is not None:
+            torch.save(self._entropy_edges.detach().cpu(), snap_dir / "entropy_edges.pt")
 
     # ──────────────────────────────────────────────────────────────────────
     # Training Loop
