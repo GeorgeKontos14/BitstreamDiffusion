@@ -70,8 +70,10 @@ def get_loader(
     if name in {'textaudio', 'libri'}:
         if task == 'tts':
             ds = TextAudioTTSDataset(config, split=split)
-        elif task == 'cont':
+        elif task == 'cont_taste':
             ds = TextAudioContinuationDataset(config, split=split)
+        elif task == 'cont_flowslm':
+            ds = TextAudioContinuationDataset(config, split=split, cache_name='flow_slm_cont_cache')
         else:
             ds = TextAudioDataset(config, split=split)
         return _make_direct_loader(ds)

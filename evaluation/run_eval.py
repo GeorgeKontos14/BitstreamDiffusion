@@ -42,7 +42,10 @@ from evaluation.evaluation_drivers.likelihood import evaluate_likelihood
 from evaluation.evaluation_drivers.vlb import evaluate_vlb
 from evaluation.evaluation_drivers.external_ppl import evaluate_external_ppl
 from evaluation.evaluation_drivers.fid_sweep import evaluate_fid_sweep
-from evaluation.evaluation_drivers.fid import evaluate_fid
+try:
+    from evaluation.evaluation_drivers.fid import evaluate_fid
+except ImportError:
+    evaluate_fid = None  # optional dep (pytorch_fid); only needed for --metrics fid
 from evaluation.evaluation_drivers.mauve import evaluate_mauve
 from evaluation.evaluation_drivers.generate_samples import evaluate_generate_samples
 from evaluation.evaluation_drivers.textaudio_generate import evaluate_textaudio_generate

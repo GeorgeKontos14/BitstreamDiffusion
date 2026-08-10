@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os
+import argparse
 
 import importlib.util
 import json
@@ -10,11 +10,14 @@ from pathlib import Path
 import torch
 from ml_collections import config_dict
 
-# TODO: Pass through arguments
-CONFIG_PATH = 'configs/textaudio/mls_632.py'
 
 def main() -> None:
-    spec = importlib.util.spec_from_file_location("config", CONFIG_PATH)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='configs/textaudio/mls_632.py')
+    args = parser.parse_args()
+    config_path = args.config
+
+    spec = importlib.util.spec_from_file_location("config", config_path)
     cfg_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cfg_module)
     cfg = cfg_module.get_config()
@@ -39,7 +42,7 @@ def main() -> None:
             saved_cfg_dict = json.load(f)
         _train_entry._update_cfg_from_dict(cfg, saved_cfg_dict)
         print(f"[regen] merged saved config from {saved_cfg_path}")
-    cfg._config_path = str(Path(CONFIG_PATH).resolve())
+    cfg._config_path = str(Path(config_path).resolve())
 
     raw_ckpt_meta = torch.load(last_ckpt, map_location='meta', weights_only=False, mmap=True)
     current_epoch = int(raw_ckpt_meta.get('epoch', -1))

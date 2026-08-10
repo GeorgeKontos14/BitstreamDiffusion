@@ -1,3 +1,4 @@
+import math
 import re
 from pathlib import Path
 
@@ -12,7 +13,9 @@ from scipy.linalg import sqrtm
 
 from typing import Any, Dict, List
 
-from transformers import AutoFeatureExtractor, AutoTokenizer, WavLMForXVector, WavLMModel, AutoModelForCausalLM
+from transformers import AutoFeatureExtractor, AutoTokenizer, WavLMModel, AutoModelForCausalLM
+
+from utils.speaker_verification import ECAPA_TDNN_SMALL
 
 # Task IDs
 UNCONDITIONAL = 0
@@ -20,6 +23,22 @@ TEXT_TO_SPEECH = 1
 SPEECH_TO_TEXT = 2
 SPEECH_CONTINUATION = 3
 CONDITIONAL_TASKS = [TEXT_TO_SPEECH, SPEECH_TO_TEXT, SPEECH_CONTINUATION]
+
+# Continuation samples are prefixed with this many seconds of reference
+# (non-generated) audio -- matches scripts/multimodal_textaudio/prepare_test.py's
+# CONT_TRIM_SECONDS used when building the continuation cache.
+CONT_TRIM_SECONDS = 3.0
+
+
+def _trim_prefix_seconds(wav, seconds: float, sr: int):
+    """Drops the first `seconds` of a waveform (the reference prefix for
+    continuation samples). Returns None if nothing is left afterward."""
+    if wav is None:
+        return None
+    arr = np.asarray(wav, dtype=np.float32).flatten()
+    skip = int(round(seconds * sr))
+    trimmed = arr[skip:]
+    return trimmed if trimmed.size > 0 else None
 
 def _sample_tasks_and_cond_masks(
     cfg: config_dict.ConfigDict, B: int, S: int, device: torch.device, bits_per_token: int = 18
@@ -114,7 +133,7 @@ def load_ref_audio_cache(root, split: str, task: str, partition: str = 'clean', 
     if split == 'val':
         path = root / 'validation' / f'cache_val_{task}_632.ref_audio.npz'
     else:
-        path = root / 'test' / f'cache_test_{partition}_{task}_632.ref_audio.npz'
+        path = root / 'test' / f'cache_test_{partition}_{task}.ref_audio.npz'
 
     if not path.exists():
         msg = f"[{task} ref-audio] {path} not found -- reference audio will be skipped for now"
@@ -160,32 +179,38 @@ class UTMOS:
 class TextAudioEvaluator:
     def __init__(
             self,
-            whisper_model: str = 'openai/whisper-medium', 
+            whisper_model: str = 'openai/whisper-medium',
             sr=16_000,
-            speaker_extractor: str = 'microsoft/wavlm-base-plus-sv',
+            speaker_checkpoint: str = 'assets/wavlm_large_finetune.pth',
             speech_extractor: str = 'microsoft/wavlm-large',
             text_model: str = 'meta-llama/Llama-3.2-1B',
             statistics_path: str = None,
+            e2v_model: str = 'iic/emotion2vec_base',
+            e2v_statistics_path: str = 'datasets/test/fsd_ref_stats_500_e2v.npz',
             partition: str = 'clean',
             _dbg_func=None,
-            speaker_ref_path: str = 'datasets/tts/ref_speaker_embeddings.npz',
+            speaker_ref_path: str = 'datasets/test/ref_speaker_embeddings.npz',
             asr_num_workers: int = 4,
         ):
         self._whisper_name = whisper_model
-        self._speaker_extractor_name = speaker_extractor
+        self._speaker_checkpoint_path = speaker_checkpoint
         self._feature_extractor_name = speech_extractor
         self._text_model_name = text_model
         self._statistics_path = statistics_path
+        self._e2v_model_name = e2v_model
+        self._e2v_statistics_path = e2v_statistics_path
         self._speaker_ref_path = speaker_ref_path
         self._asr_num_workers = int(asr_num_workers)
         self._sr = sr
         self._asr = None
-        self._speaker_extractor = None
         self._speaker_model = None
+        self._fsd_feature_extractor = None
         self._feature_extractor = None
+        self._e2v_model = None
         self._text_extractor = None
         self._text_model = None
         self.reference_statistics = None
+        self.e2v_reference_statistics = None
         self.partition = partition
         self._utmos = None
         self._dbg_func = _dbg_func
@@ -285,17 +310,14 @@ class TextAudioEvaluator:
             return float('nan')
         return float(cer(refs, hyps))
 
-    def _ensure_speaker_extractor(self, device):
-        if self._speaker_extractor is None:
-            self._speaker_extractor  = AutoFeatureExtractor.from_pretrained(
-                self._speaker_extractor_name
-            )
+    def _ensure_speaker_model(self, device):
         if self._speaker_model is None:
-            self._speaker_model = WavLMForXVector.from_pretrained(
-                self._speaker_extractor_name
-            )
-            self._speaker_model.eval()
-        return self._speaker_extractor, self._speaker_model
+            model = ECAPA_TDNN_SMALL(feat_dim=1024, feat_type='wavlm_large', config_path=None)
+            state_dict = torch.load(self._speaker_checkpoint_path, map_location='cpu')
+            model.load_state_dict(state_dict['model'], strict=False)
+            model.eval()
+            self._speaker_model = model.to(device)
+        return self._speaker_model
 
     def _ensure_ref_speaker_embeddings(self, device):
         if self._ref_speaker_embeddings is None:
@@ -303,40 +325,48 @@ class TextAudioEvaluator:
             embeddings = data[f'{self.partition}_embeddings']
             self._ref_speaker_embeddings = torch.from_numpy(embeddings).float()
         return self._ref_speaker_embeddings.to(device)
-    
-    def spksim(self, gen_wavs, device) -> float:
-        extractor, model = self._ensure_speaker_extractor(device)
-        ref_embeddings = self._ensure_ref_speaker_embeddings(device)
-        
-        gen_wavs = [np.asarray(wav, dtype=np.float32).flatten() for wav in gen_wavs]
-    
-        inputs = extractor(
-            gen_wavs, return_tensors='pt', padding=True, sampling_rate=self._sr
-        )
-        inputs = {k: v.to(device) for k,v in inputs.items()}
 
+    def spksim(self, gen_wavs, device) -> float:
+        model = self._ensure_speaker_model(device)
+        ref_embeddings = self._ensure_ref_speaker_embeddings(device).cpu()
+
+        gen_embeddings = []
         with torch.no_grad():
-            gen_embeddings = model(**inputs).embeddings
-        gen_embeddings = torch.nn.functional.normalize(gen_embeddings, dim=-1).cpu()
-        return (ref_embeddings*gen_embeddings).sum(dim=-1).mean().item()
+            for wav in gen_wavs:
+                arr = np.asarray(wav, dtype=np.float32).flatten()
+                x = torch.from_numpy(arr).unsqueeze(0).to(device)
+                emb = model(x)
+                gen_embeddings.append(emb.squeeze(0).cpu())
+        gen_embeddings = torch.nn.functional.normalize(torch.stack(gen_embeddings, dim=0), dim=-1)
+
+        return (ref_embeddings * gen_embeddings).sum(dim=-1).mean().item()
 
     def _ensure_feature_extractor(self, device):
-        if self._speaker_extractor is None:
-            self._speaker_extractor  = AutoFeatureExtractor.from_pretrained(
-                self._speaker_extractor_name
+        if self._fsd_feature_extractor is None:
+            self._fsd_feature_extractor = AutoFeatureExtractor.from_pretrained(
+                self._feature_extractor_name
             )
         if self._feature_extractor is None:
             self._feature_extractor = WavLMModel.from_pretrained(
                 self._feature_extractor_name
             ).to(device)
             self._feature_extractor.eval()
-        return self._speaker_extractor, self._feature_extractor
+        return self._fsd_feature_extractor, self._feature_extractor
     
     def _ensure_refernce_statistics(self):
         if self.reference_statistics is None:
             stats = np.load(self._statistics_path)
-            self.reference_statistics = (stats[f'{self.partition}_mean'], stats[f'{self.partition}_cov'])
+            self.reference_statistics = (stats['mean'], stats['cov'])
         return self.reference_statistics
+
+    @staticmethod
+    def _frechet_distance(ref_mean, ref_cov, gen_mean, gen_cov) -> float:
+        mean_diff = ref_mean - gen_mean
+        tr, _ = sqrtm(ref_cov @ gen_cov, disp=False)
+        if np.iscomplexobj(tr):
+            tr = tr.real
+        tr = np.trace(ref_cov + gen_cov - 2 * tr)
+        return mean_diff @ mean_diff + tr
 
     def fsd(self, wavs, device, chunk_size: int = 32) -> float:
         extractor, model = self._ensure_feature_extractor(device)
@@ -351,18 +381,60 @@ class TextAudioEvaluator:
             inputs = {k: v.to(device) for k, v in inputs.items()}
             with torch.no_grad():
                 out = model(**inputs, output_hidden_states=True)
-            all_embs.append(out.hidden_states[6].mean(dim=1).cpu().float().numpy())
+            all_embs.append(out.hidden_states[6].reshape(-1,1024).cpu().float().numpy())
         embedding = np.concatenate(all_embs, axis=0)
 
         gen_mean = np.mean(embedding, axis=0)
         gen_cov = np.cov(embedding, rowvar=False)
+        return self._frechet_distance(ref_mean, ref_cov, gen_mean, gen_cov)
 
-        mean_diff = ref_mean - gen_mean
-        tr, _ = sqrtm(ref_cov @ gen_cov, disp=False)
-        if np.iscomplexobj(tr):
-            tr = tr.real
-        tr = np.trace(ref_cov + gen_cov - 2 * tr)
-        return mean_diff @ mean_diff + tr    
+    def _ensure_e2v_model(self, device):
+        if self._e2v_model is None:
+            from funasr import AutoModel
+            am = AutoModel(model=self._e2v_model_name, device=str(device))
+            self._e2v_model = am.model.to(device).eval()
+        return self._e2v_model
+
+    def _ensure_e2v_reference_statistics(self):
+        if self.e2v_reference_statistics is None:
+            stats = np.load(self._e2v_statistics_path)
+            self.e2v_reference_statistics = (stats['mean'], stats['cov'])
+        return self.e2v_reference_statistics
+
+    @torch.no_grad()
+    def _e2v_frame_embeddings(self, wavs, model, device, batch_size: int = 32) -> np.ndarray:
+        out = []
+        n = len(wavs)
+        for start in range(0, n, batch_size):
+            chunk = wavs[start:start + batch_size]
+            lengths = [len(w) for w in chunk]
+            max_len = max(lengths)
+            batch = torch.zeros(len(chunk), max_len, dtype=torch.float32, device=device)
+            pad_mask = torch.ones(len(chunk), max_len, dtype=torch.bool, device=device)  # True = pad
+            for i, w in enumerate(chunk):
+                t = torch.as_tensor(w, dtype=torch.float32)
+                batch[i, :len(t)] = t.to(device)
+                pad_mask[i, :len(t)] = False
+
+            feats = model.extract_features(batch, padding_mask=pad_mask)
+            hidden = feats['x']                 # (B, T', C)
+            frame_mask = feats['padding_mask']  # (B, T') True = pad, or None if nothing was padded
+
+            for i in range(hidden.size(0)):
+                valid = hidden[i] if frame_mask is None else hidden[i][~frame_mask[i]]
+                out.append(valid.cpu().float().numpy())
+        return np.concatenate(out, axis=0)
+
+    def fsd_e2v(self, wavs, device, chunk_size: int = 32) -> float:
+        model = self._ensure_e2v_model(device)
+        ref_mean, ref_cov = self._ensure_e2v_reference_statistics()
+
+        wavs = [np.asarray(wav, dtype=np.float32).flatten() for wav in wavs]
+        embedding = self._e2v_frame_embeddings(wavs, model, device, batch_size=chunk_size)
+
+        gen_mean = np.mean(embedding, axis=0)
+        gen_cov = np.cov(embedding, rowvar=False)
+        return self._frechet_distance(ref_mean, ref_cov, gen_mean, gen_cov)
 
     def _ensure_text_model(self, device):
         if self._text_extractor is None:
@@ -374,28 +446,39 @@ class TextAudioEvaluator:
             ).to(device).eval()
         return self._text_extractor, self._text_model
 
-    def gen_ppl(self,hyps,device) -> float:
+    def gen_ppl(self, hyps, device, chunk_size: int = 32) -> float:
         extractor, model = self._ensure_text_model(device)
-        
-        inputs = extractor(hyps, return_tensors='pt', padding=True).to(model.device)
-        labels = inputs['input_ids'].clone()
-        labels[inputs['attention_mask'] == 0] = -100
 
-        with torch.no_grad():
-            logits = model(**inputs).logits
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
+        all_perplexities: List[float] = []
+        for i in range(0, len(hyps), chunk_size):
+            chunk = hyps[i : i + chunk_size]
+            inputs = extractor(chunk, return_tensors='pt', padding=True).to(model.device)
+            labels = inputs['input_ids'].clone()
+            labels[inputs['attention_mask'] == 0] = -100
 
-        loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
-        token_losses = loss_fn(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1)
-        ).view(shift_labels.size())
-        mask = shift_labels != -100
-        mean_loss_per_sample = (token_losses * mask).sum(dim=1) / mask.sum(dim=1)
-        perplexities = torch.exp(mean_loss_per_sample).tolist()
+            with torch.no_grad():
+                logits = model(**inputs).logits
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
 
-        return sum(perplexities/len(perplexities))
+            loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
+            token_losses = loss_fn(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1)
+            ).view(shift_labels.size())
+            mask = shift_labels != -100
+            mean_loss_per_sample = (token_losses * mask).sum(dim=1) / mask.sum(dim=1)
+            all_perplexities.extend(torch.exp(mean_loss_per_sample).tolist())
+
+        finite = [p for p in all_perplexities if math.isfinite(p)]
+        n_dropped = len(all_perplexities) - len(finite)
+        if n_dropped:
+            self._dbg(
+                f'gen_ppl: {n_dropped}/{len(all_perplexities)} samples had non-finite perplexity'
+            )
+        if not finite:
+            return float('nan')
+        return sum(finite) / len(finite)
 
     def evaluate_task_brief(
         self, task:str, gen_texts:List[str], ref_texts: List[str], gen_wavs, device
@@ -447,15 +530,18 @@ class TextAudioEvaluator:
         elif task == 'stt':
             metrics[f'{self.partition}-WER'] = self.word_error_rate(ref_texts, gen_texts)
             metrics[f'{self.partition}-CER'] = self.character_error_rate(ref_texts, gen_texts)
-        elif task == 'cont':
-            transcriptions = self.transcribe(gen_wavs, device)
+        elif task == 'cont_taste':
+            trimmed_wavs = [_trim_prefix_seconds(w, CONT_TRIM_SECONDS, self._sr) for w in gen_wavs]
+            transcriptions = self.transcribe(trimmed_wavs, device)
             metrics['UTMOS'] = self.utmos_score(gen_wavs)
+        elif task == 'cont_flowslm':
+            transcriptions = self.transcribe(gen_wavs, device)
             metrics['WER'] = self.word_error_rate(gen_texts, transcriptions)
             metrics['CER'] = self.character_error_rate(gen_texts, transcriptions)
             metrics['GenPPL-text'] = self.gen_ppl(gen_texts, device)
             metrics['GenPPL-speech'] = self.gen_ppl(transcriptions, device)
-            metrics['FSD'] = self.fsd(gen_wavs, device)
-            # metrics['LLM-as-a-Judge'] = 0
+            metrics['FSD-wlm'] = self.fsd(gen_wavs, device)
+            metrics['FSD-e2v'] = self.fsd_e2v(gen_wavs, device)
 
         return metrics, transcriptions
  

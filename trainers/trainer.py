@@ -246,8 +246,10 @@ def _save_config_to_run_dir(cfg, run_dir: Path):
     cfg_dict = _cfg_to_dict(cfg)
 
     cfg_json_path = run_dir / "config.json"
-    with open(cfg_json_path, "w") as f:
+    tmp_path = run_dir / f".config.json.tmp.{os.getpid()}"
+    with open(tmp_path, "w") as f:
         json.dump(cfg_dict, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, cfg_json_path)
 
     config_path = getattr(cfg, "_config_path", None)
     if config_path is not None and os.path.isfile(config_path):
@@ -266,6 +268,9 @@ class _NullWriter:
         pass
 
     def add_image(self, *args, **kwargs):
+        pass
+
+    def add_audio(self, *args, **kwargs):
         pass
 
     def add_figure(self, *args, **kwargs):

@@ -309,6 +309,15 @@ def load_tokenizers(
     if (speech_bottleneck is None) == (speech_bottleneck_dims is None):
         raise ValueError('Provide exactly one of speech_bottleneck or speech_bottleneck_dims')
 
+    # sparktts isn't a pip-installed package -- it's the Spark-TTS/sparktts
+    # submodule directory, only importable once Spark-TTS/ itself is on
+    # sys.path. Do this here rather than relying on every caller's own
+    # PYTHONPATH to remember it.
+    import sys
+    spark_tts_dir = Path(__file__).resolve().parents[2] / 'Spark-TTS'
+    if str(spark_tts_dir) not in sys.path:
+        sys.path.insert(0, str(spark_tts_dir))
+
     import tiktoken
     from sparktts.models.bicodec import BiCodec
     from stable_codec import StableCodec
@@ -732,11 +741,17 @@ def _chunks(seq: list, size: int):
         yield seq[i:i + size]
 
 
-def _geometry_suffix(text_seq_len: int, speaker_seq_len: int, speech_seq_len: int) -> str:
-    # data/textaudio.py's _val_test_geometry_suffix: '' only at the original
-    # 1000-token geometry, f'_{n}' otherwise -- applied to asr/tts filenames,
-    # never to continuation's (its dataset class never geometry-suffixes).
+def _geometry_suffix(
+    text_seq_len: int, speaker_seq_len: int, speech_seq_len: int, always_suffix: bool = False,
+) -> str:
+    # data/textaudio.py's _val_geometry_suffix/_test_geometry_suffix: applied to
+    # asr/tts filenames, never to continuation's (its dataset class never
+    # geometry-suffixes). validation/ caches (always_suffix=False) leave the
+    # original 1000-token geometry unsuffixed, matching legacy filenames;
+    # test/ caches (always_suffix=True) suffix every geometry, including 1000.
     total = text_seq_len + speaker_seq_len + speech_seq_len
+    if always_suffix:
+        return f'_{total}'
     return '' if total == 1000 else f'_{total}'
 
 
@@ -748,7 +763,8 @@ def build_asr_cache(
     text_tokenizer_name: str, speaker_model_dir: str, speech_model: str,
     text_seq_len: int, speaker_seq_len: int, speech_seq_len: int,
     device, batch_size: int = 32, size: Optional[int] = None,
-    max_duration: Optional[float] = None, ref_audio_suffix: str = '632',
+    max_duration: Optional[float] = None, ref_audio_suffix: Optional[str] = None,
+    always_suffix: bool = False,
 ) -> list:
     """
     text + speaker(own audio) + speech(own audio) -> packed_multimodal_blocks.
@@ -797,7 +813,7 @@ def build_asr_cache(
             rows_out[j] = batch_rows[k]
         print(f'[{split_name}] asr: tokenized {min(batch_idx_list[-1] + 1, n)}/{n}', flush=True)
 
-    suffix = _geometry_suffix(text_seq_len, speaker_seq_len, speech_seq_len)
+    suffix = _geometry_suffix(text_seq_len, speaker_seq_len, speech_seq_len, always_suffix)
     cache_path = out_dir / f'{stem}_asr{suffix}.uint32'
     meta_path = out_dir / f'{stem}_asr{suffix}.meta.json'
     rows_out.tofile(cache_path)
@@ -814,7 +830,8 @@ def build_asr_cache(
     }
     with open(meta_path, 'w', encoding='utf-8') as f:
         json.dump(meta, f, indent=2)
-    write_ref_audio_npz(out_dir / f'{stem}_asr_{ref_audio_suffix}.ref_audio.npz', ref_wavs)
+    ref_suffix = f'_{ref_audio_suffix}' if ref_audio_suffix else ''
+    write_ref_audio_npz(out_dir / f'{stem}_asr{ref_suffix}.ref_audio.npz', ref_wavs)
     print(f'[{split_name}] asr: wrote {cache_path} + ref_audio.npz ({n} rows)')
     return picked
 
@@ -827,7 +844,7 @@ def build_tts_cache(
     text_tokenizer_name: str, speaker_model_dir: str, speech_model: str,
     text_seq_len: int, speaker_seq_len: int, speech_seq_len_for_suffix: int,
     device, batch_size: int = 32, size: Optional[int] = None,
-    ref_audio_suffix: str = '632',
+    ref_audio_suffix: Optional[str] = None, always_suffix: bool = False,
 ) -> list:
     """
     text(own) + speaker(the speaker's held-out reference sample) -> packed_tts_blocks
@@ -898,7 +915,7 @@ def build_tts_cache(
     for j in range(n):
         rows_out[j, text_seq_len:] = speaker_tokens_by_spk[row_speaker_ids[j]]
 
-    suffix = _geometry_suffix(text_seq_len, speaker_seq_len, speech_seq_len_for_suffix)
+    suffix = _geometry_suffix(text_seq_len, speaker_seq_len, speech_seq_len_for_suffix, always_suffix)
     cache_path = out_dir / f'{stem}_tts{suffix}.uint32'
     meta_path = out_dir / f'{stem}_tts{suffix}.meta.json'
     rows_out.tofile(cache_path)
@@ -915,7 +932,8 @@ def build_tts_cache(
     }
     with open(meta_path, 'w', encoding='utf-8') as f:
         json.dump(meta, f, indent=2)
-    write_ref_audio_npz(out_dir / f'{stem}_tts_{ref_audio_suffix}.ref_audio.npz', ref_wavs)
+    ref_suffix = f'_{ref_audio_suffix}' if ref_audio_suffix else ''
+    write_ref_audio_npz(out_dir / f'{stem}_tts{ref_suffix}.ref_audio.npz', ref_wavs)
     print(f'[{split_name}] tts: wrote {cache_path} + ref_audio.npz ({n} rows, {len(unique_speakers)} speakers)')
     return picked
 

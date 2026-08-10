@@ -164,7 +164,7 @@ def _build_sampler_specs(cfg: Any, c: Any) -> List[_SamplerSpec]:
                 sampler_name=sampler_name,
                 target_nfe=target_nfe,
                 self_condition=self_condition,
-                sc_refresh_mode="refined",
+                sc_refresh_mode="carry",
                 return_probs=True,
             )
             for s_churn in s_churns:
@@ -470,6 +470,7 @@ class TextAudioCallback:
                 B, r.sequence_len,
                 schedule=schedule,
                 num_steps=spec.num_steps,
+                sc_refresh_mode="carry",
                 entropic_blend_alpha=r.entropic_blend_alpha,
                 entropy_run_dir=entropy_run_dir,
                 sigma_min_override=r.terminal_sigma,

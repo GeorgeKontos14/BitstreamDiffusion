@@ -57,7 +57,7 @@ def main() -> None:
         speech_model=args.speech_model,
         text_seq_len=args.text_seq_len, speaker_seq_len=args.speaker_seq_len,
         speech_seq_len=args.speech_seq_len, device=device, batch_size=args.batch_size,
-        size=args.size, max_duration=args.max_duration,
+        size=args.size, max_duration=args.max_duration, ref_audio_suffix='632',
     )
 
     tts_valid_ids = load_valid_ids(args.duration_file, args.max_duration)
@@ -69,7 +69,7 @@ def main() -> None:
         speech_model=args.speech_model,
         text_seq_len=args.text_seq_len, speaker_seq_len=args.speaker_seq_len,
         speech_seq_len_for_suffix=args.speech_seq_len, device=device, batch_size=args.batch_size,
-        size=args.size,
+        size=args.size, ref_audio_suffix='632',
     )
 
     cont_valid_ids = load_valid_ids(args.duration_file, args.max_duration, min_duration=CONT_TRIM_SECONDS)

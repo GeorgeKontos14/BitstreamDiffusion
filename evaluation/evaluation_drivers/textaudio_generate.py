@@ -1,6 +1,7 @@
 
 import json
 import math
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +22,6 @@ from diffusion.continuous.processes import ContinuousForwardProcess
 from evaluation.distributed import barrier, gather_varlen_firstdim_to_rank0
 from evaluation.evaluation_drivers.utils import _resolve_eval_dirs
 from evaluation.utils import resolve_eval_amp, resolve_entropy_run_dir
-from utils.model_utils import unwrap_model
 from utils.textaudio_utils import (
     _fixed_mask,
     _safe_decode,
@@ -60,14 +60,30 @@ def _dbg(msg: str, *, all_ranks: bool = False) -> None:
 # -----------------------------------------------------------------------------
 # Task Definition
 # -----------------------------------------------------------------------------
-TASKS = ['joint', 'tts', 'stt', 'cont', 'salmon']
+# 'cont_taste', 'cont_flowslm', 'cont_salmon' are the three continuation-eval
+# protocols. Specify 'cont' in the config for all three
+CONT_SUBTASKS = ['cont_taste', 'cont_flowslm', 'cont_salmon']
+TASKS = ['joint', 'tts', 'stt'] + CONT_SUBTASKS
 DEFAULT_TASKS = ['joint', 'tts', 'stt', 'cont']
 TASK_IDS = {
     'joint': UNCONDITIONAL,
     'tts': TEXT_TO_SPEECH,
     'stt': SPEECH_TO_TEXT,
-    'cont': SPEECH_CONTINUATION,
+    'cont_taste': SPEECH_CONTINUATION,
+    'cont_flowslm': SPEECH_CONTINUATION,
 }
+
+
+def _resolve_task_list(raw_tasks) -> List[str]:
+    resolved: List[str] = []
+    for t in raw_tasks:
+        if t == "cont":
+            for sub in CONT_SUBTASKS:
+                if sub not in resolved:
+                    resolved.append(sub)
+        elif t in TASKS and t not in resolved:
+            resolved.append(t)
+    return resolved
 
 # -----------------------------------------------------------------------------
 # Sampler specs
@@ -83,8 +99,21 @@ class _SamplerSpec:
     s_churn: Optional[float]  # extract from config
     gamma: Optional[float]    # report
     guidance_scale: float
+    sc_refresh_mode: str
+    tasks: List[str]          # tasks generated under this sampler spec
+    gamma_eff: float = 0.0    # PredictorCorrectorSampler's corrector strength
 
-def _build_sampler_specs(cfg: Any, c: Any) -> List[_SamplerSpec]:
+
+def _spec_to_dict(s: '_SamplerSpec') -> Dict[str, Any]:
+    return {
+        'tag': s.tag, 'sampler_name': s.sampler_name, 'num_steps': s.num_steps,
+        'target_nfe': s.target_nfe, 'actual_nfe': s.actual_nfe,
+        'stochastic_enabled': s.stochastic_enabled, 'gamma': s.gamma,
+        'guidance_scale': s.guidance_scale, 'sc_refresh_mode': s.sc_refresh_mode,
+        'gamma_eff': s.gamma_eff, 'tasks': s.tasks,
+    }
+
+def _build_sampler_specs(cfg: Any, c: Any, default_tasks) -> List[_SamplerSpec]:
     """
     Expands cfg.evaluation.multimodal_text_audio.sampling_sweep.specs into one
     _SamplerSpec per (target_nfe x s_churn x guidance_scale) combination.
@@ -109,6 +138,14 @@ def _build_sampler_specs(cfg: Any, c: Any) -> List[_SamplerSpec]:
         sampler_name = str(base.sampler_name)
         target_nfes = [int(n) for n in base.target_nfes]
         stochastic_enabled = bool(getattr(base, 'stochastic_enabled', False))
+        sc_refresh_mode = str(getattr(base, 'sc_refresh_mode', 'carry'))
+
+        raw_tasks = list(getattr(base, 'tasks', None) or default_tasks)
+        tasks = _resolve_task_list(raw_tasks)
+        if not tasks:
+            raise ValueError(
+                f"No valid tasks resolved for sampler_name={sampler_name!r} (raw tasks={raw_tasks!r})."
+            )
 
         if stochastic_enabled:
             s_churns = [float(v) for v in getattr(base, 's_churns', [])]
@@ -123,13 +160,18 @@ def _build_sampler_specs(cfg: Any, c: Any) -> List[_SamplerSpec]:
         if not guidance_scales:
             guidance_scales = [0.0]
 
+        # Effective Langevin correction strength for Euler-Maruyama sampler
+        gamma_effs = [float(v) for v in getattr(base, 'gamma_effs', [0.0])]
+        if not gamma_effs:
+            gamma_effs = [0.0]
+
         for target_nfe in target_nfes:
             num_steps, actual_nfe = steps_for_target_nfe(
                 framework=framework,
                 sampler_name=sampler_name,
                 target_nfe=target_nfe,
                 self_condition=self_condition,
-                sc_refresh_mode="refined",
+                sc_refresh_mode=sc_refresh_mode,
                 return_probs=True,
             )
             for s_churn in s_churns:
@@ -138,27 +180,35 @@ def _build_sampler_specs(cfg: Any, c: Any) -> List[_SamplerSpec]:
                     if (stochastic_enabled and num_steps > 0) else None
                 )
                 for guidance_scale in guidance_scales:
-                    tag = f"{sampler_name}_nfe{target_nfe}"
-                    if stochastic_enabled:
-                        tag += f"_stoch-g{gamma:.4g}"
-                    if guidance_scale > 0.0:
-                        tag += f"_gs{guidance_scale:g}"
+                    for gamma_eff in gamma_effs:
+                        tag = f"{sampler_name}_nfe{target_nfe}"
+                        if stochastic_enabled:
+                            tag += f"_stoch-g{gamma:.4g}"
+                        if gamma_eff > 0.0:
+                            tag += f"_emg{gamma_eff:.4g}"
+                        if guidance_scale > 0.0:
+                            tag += f"_gs{guidance_scale:g}"
+                        if sc_refresh_mode != 'carry':
+                            tag += f"_scr-{sc_refresh_mode}"
 
-                    if tag in seen_tags:
-                        raise ValueError(f"Duplicate textaudio sampling spec tag: {tag!r}")
-                    seen_tags.add(tag)
+                        if tag in seen_tags:
+                            raise ValueError(f"Duplicate textaudio sampling spec tag: {tag!r}")
+                        seen_tags.add(tag)
 
-                    specs.append(_SamplerSpec(
-                        tag=tag,
-                        sampler_name=sampler_name,
-                        num_steps=num_steps,
-                        target_nfe=target_nfe,
-                        actual_nfe=actual_nfe,
-                        stochastic_enabled=stochastic_enabled,
-                        s_churn=s_churn,
-                        gamma=gamma,
-                        guidance_scale=guidance_scale,
-                    ))
+                        specs.append(_SamplerSpec(
+                            tag=tag,
+                            sampler_name=sampler_name,
+                            num_steps=num_steps,
+                            target_nfe=target_nfe,
+                            actual_nfe=actual_nfe,
+                            stochastic_enabled=stochastic_enabled,
+                            s_churn=s_churn,
+                            gamma=gamma,
+                            guidance_scale=guidance_scale,
+                            sc_refresh_mode=sc_refresh_mode,
+                            tasks=tasks,
+                            gamma_eff=gamma_eff,
+                        ))
 
     return specs
 
@@ -182,7 +232,10 @@ def get_sharded_test_loaders(
 
     loaders: Dict[str, Any] = {
         'tts': _sharded(get_loader(cfg, split='test', task='tts', batch_size=batch_size).dataset),
-        'cont': _sharded(get_loader(cfg, split='test', task='cont', batch_size=batch_size).dataset),
+        'cont_taste': _sharded(get_loader(cfg, split='test', task='cont_taste', batch_size=batch_size).dataset),
+        'cont_flowslm': _sharded(
+            get_loader(cfg, split='test', task='cont_flowslm', batch_size=batch_size).dataset
+        ),
     }
 
     data_cfg = cfg.data
@@ -203,6 +256,11 @@ def get_sharded_test_loaders(
 # Generation helpers
 # -----------------------------------------------------------------------------
 def _get_sampler(model, proc, cfg, sampler_name: str, cache: Dict[str, Any]):
+    if "euler_maruyama" in sampler_name:
+        from diffusion.continuous.samplers import EulerMaruyamaSampler
+        if cache.get("euler_maruyama") is None:
+            cache["euler_maruyama"] = EulerMaruyamaSampler(model, proc, cfg)
+        return cache["euler_maruyama"]
     if "ddim" in sampler_name:
         from diffusion.continuous.samplers import DDIMSampler
         if cache.get("ddim") is None:
@@ -264,7 +322,7 @@ def _generate_with_mask(
     schedule = 'entropic' if 'entropic' in spec.sampler_name else 'karras'
     sampler_obj = _get_sampler(model, proc, cfg, spec.sampler_name, sampler_cache)
 
-    stoch_overrides: Dict[str, Any] = {}
+    stoch_overrides: Dict[str, Any] = {'gamma_eff': spec.gamma_eff}
     if not spec.stochastic_enabled:
         stoch_overrides['enabled'] = False
     else:
@@ -283,6 +341,7 @@ def _generate_with_mask(
             B, sequence_len,
             schedule=schedule,
             num_steps=spec.num_steps,
+            sc_refresh_mode=spec.sc_refresh_mode,
             entropic_blend_alpha=entropic_blend_alpha,
             entropy_run_dir=entropy_run_dir,
             sigma_min_override=terminal_sigma,
@@ -409,9 +468,38 @@ def _gather_bits(local_batches: List[torch.Tensor], sequence_len: int, device) -
 # -----------------------------------------------------------------------------
 # On-disk writer (rank0 only)
 # -----------------------------------------------------------------------------
-def _write_manifest(run_dir: Path, header: Dict[str, Any]) -> None:
-    run_dir.mkdir(parents=True, exist_ok=True)
-    with open(run_dir / 'manifest.json', 'w', encoding='utf-8') as f:
+def _tag_manifest_path(run_dir: Path, tag: str) -> Path:
+    return run_dir / tag / 'manifest.json'
+
+
+def _update_tag_manifest(
+    run_dir: Path, tag: str, task: str, spec_dict: Dict[str, Any],
+    shared_header: Dict[str, Any], stt_partition: Optional[str] = None,
+) -> None:
+    path = _tag_manifest_path(run_dir, tag)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    tasks: List[str] = []
+    stt_partitions: List[str] = []
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding='utf-8'))['header']
+            tasks = list(existing.get('tasks', []))
+            stt_partitions = list(existing.get('stt_partitions', []))
+        except Exception:
+            pass
+
+    if task not in tasks:
+        tasks.append(task)
+    if stt_partition is not None and stt_partition not in stt_partitions:
+        stt_partitions.append(stt_partition)
+
+    header = dict(shared_header)
+    header['tasks'] = tasks
+    header['stt_partitions'] = stt_partitions
+    header['sampler'] = spec_dict
+
+    with open(path, 'w', encoding='utf-8') as f:
         json.dump({'header': header}, f, indent=2, ensure_ascii=False)
 
 
@@ -443,14 +531,10 @@ def generate_textaudio(cfg, model, device, rank: int, world_size: int) -> Option
     sample_rate     = int(getattr(data_cfg, "sample_rate",      16000))
     data_root       = getattr(data_cfg, "root", "datasets/")
 
-    tasks = [t for t in getattr(textaudio_cfg, "tasks", DEFAULT_TASKS) if t in TASKS]
     stt_partitions = [str(p) for p in getattr(textaudio_cfg, "stt_partitions", ["clean", "other"])]
 
-    salmon_cfg = getattr(textaudio_cfg, "salmon", None)
-    salmon_enabled = bool(getattr(salmon_cfg, "enabled", False))
-    salmon_ref_dir = str(getattr(salmon_cfg, "ref_dir", "datasets/continuation"))
-    if salmon_enabled and "salmon" not in tasks:
-        tasks.append("salmon")
+    cont_salmon_cfg = getattr(textaudio_cfg, "cont_salmon", None)
+    salmon_ref_dir = str(getattr(cont_salmon_cfg, "ref_dir", "datasets/continuation"))
 
     terminal_sigma = float(getattr(textaudio_cfg, "terminal_sigma", 0.08))
     entropic_blend_alpha = float(getattr(textaudio_cfg, "entropic_blend_alpha", 0.0))
@@ -463,7 +547,9 @@ def generate_textaudio(cfg, model, device, rank: int, world_size: int) -> Option
         getattr(textaudio_cfg, "batch_size", getattr(eval_cfg, "batch_size", getattr(cfg.train, "batch_size", 32)))
     )
 
-    samplers = _build_sampler_specs(cfg, textaudio_cfg)
+    default_tasks_raw = getattr(textaudio_cfg, "tasks", DEFAULT_TASKS)
+    samplers = _build_sampler_specs(cfg, textaudio_cfg, default_tasks=default_tasks_raw)
+    all_tasks = sorted({t for spec in samplers for t in spec.tasks})
 
     fw = str(getattr(cfg, 'framework', 'continuous_score'))
     if fw != 'continuous_score':
@@ -475,41 +561,27 @@ def generate_textaudio(cfg, model, device, rank: int, world_size: int) -> Option
     ckpt_tag = Path(str(getattr(cfg.evaluation, "checkpoint_path", "checkpoint"))).stem
     run_dir = out_dir / "textaudio_eval" / ckpt_tag
 
-    _dbg(f"Tasks: {tasks}")
-    _dbg(f"Samplers: {[spec.tag for spec in samplers]}")
+    _dbg(f"Samplers: {[(spec.tag, spec.tasks) for spec in samplers]}")
     _dbg(f"world_size={world_size} -> each task's samples sharded across ranks, gathered to rank0 for decode+write")
     _dbg(f"run_dir: {run_dir}")
 
-    if _rank0():
-        header = {
-            'title': 'Single-stream Joint Audio+Text Generation (multi-GPU generation, rank0-written)',
-            'experiment': str(getattr(cfg, "experiment", "unknown")),
-            'text_tokenizer': str(getattr(data_cfg, "text_tokenizer", "o200k_base")),
-            'speaker_tokenizer': str(getattr(data_cfg, "speaker_tokenizer", "bicodec")),
-            'speech_tokenizer': str(getattr(data_cfg, "speech_tokenizer", "stabilityai/stable-codec-speech-16k")),
-            'bits_per_token': bits_per_token,
-            'sequence_layout': {
-                'text_tokens': text_seq_len,
-                'speaker_tokens': speaker_seq_len,
-                'total_tokens': int(sequence_len // bits_per_token),
-            },
-            'checkpoint': str(getattr(cfg.evaluation, "checkpoint_path", "")),
-            'tasks': tasks,
-            'stt_partitions': stt_partitions,
-            'num_uncond_samples': num_uncond_samples,
-            'samplers': [
-                {
-                    'tag': s.tag, 'sampler_name': s.sampler_name, 'num_steps': s.num_steps,
-                    'target_nfe': s.target_nfe, 'actual_nfe': s.actual_nfe,
-                    'stochastic_enabled': s.stochastic_enabled, 'gamma': s.gamma,
-                    'guidance_scale': s.guidance_scale,
-                }
-                for s in samplers
-            ],
-            'sample_rate': sample_rate,
-            'world_size': world_size,
-        }
-        _write_manifest(run_dir, header)
+    shared_header = {
+        'title': 'Single-stream Joint Audio+Text Generation (multi-GPU generation, rank0-written)',
+        'experiment': str(getattr(cfg, "experiment", "unknown")),
+        'text_tokenizer': str(getattr(data_cfg, "text_tokenizer", "o200k_base")),
+        'speaker_tokenizer': str(getattr(data_cfg, "speaker_tokenizer", "bicodec")),
+        'speech_tokenizer': str(getattr(data_cfg, "speech_tokenizer", "stabilityai/stable-codec-speech-16k")),
+        'bits_per_token': bits_per_token,
+        'sequence_layout': {
+            'text_tokens': text_seq_len,
+            'speaker_tokens': speaker_seq_len,
+            'total_tokens': int(sequence_len // bits_per_token),
+        },
+        'checkpoint': str(getattr(cfg.evaluation, "checkpoint_path", "")),
+        'num_uncond_samples': num_uncond_samples,
+        'sample_rate': sample_rate,
+        'world_size': world_size,
+    }
     barrier()
 
     # Decoding (text/speech tokenizers) only ever happens on rank0, after the
@@ -521,33 +593,44 @@ def generate_textaudio(cfg, model, device, rank: int, world_size: int) -> Option
         text_tok, speech_tok = _load_text_speech_tokenizers(cfg, device)
 
     proc = ContinuousForwardProcess(cfg)
-    raw_model = unwrap_model(model)
+    # Keep the model as handed in (compiled, if enabled) for sampling -- every
+    # other driver (fid.py, generation_driver.py) passes `model` straight into
+    # its sampler with no unwrapping. unwrap_model() strips torch.compile's
+    # wrapper too, which was silently forcing eager-mode generation here and
+    # producing markedly worse samples/metrics than the compiled model used
+    # by utils/callbacks/textaudio_generation.py's offline generation path.
+    raw_model = model
     sampler_cache: Dict[str, Any] = {}
 
     torch.manual_seed(seed + 1000 * rank)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed + 1000 * rank)
 
-    salmon_prompts = _load_salmon_prompts(salmon_ref_dir) if 'salmon' in tasks else {}
+    salmon_prompts = _load_salmon_prompts(salmon_ref_dir) if 'cont_salmon' in all_tasks else {}
 
     loaders: Dict[str, Any] = {}
-    if any(t in ('tts', 'cont', 'stt') for t in tasks):
+    if any(t in ('tts', 'cont_taste', 'cont_flowslm', 'stt') for t in all_tasks):
         loaders = get_sharded_test_loaders(cfg, gen_batch_size, stt_partitions, rank, world_size)
 
     tts_ref_cache = (
         load_ref_audio_cache(data_root, split='test', task='tts', partition='clean', dbg=_dbg)
-        if (_rank0() and 'tts' in tasks) else None
+        if (_rank0() and 'tts' in all_tasks) else None
     )
     stt_ref_cache_by_partition = (
         {p: load_ref_audio_cache(data_root, split='test', task='asr', partition=p, dbg=_dbg) for p in stt_partitions}
-        if (_rank0() and 'stt' in tasks) else {}
+        if (_rank0() and 'stt' in all_tasks) else {}
     )
 
     model.eval()
+    # Ref audio (ref_wav) doesn't depend on the sampler -- write it only the
+    # first time each task is generated, whichever spec that happens under
+    # (specs no longer all share the same task list).
+    refs_written: set = set()
     with torch.no_grad():
-        for task in tasks:
-            for spec_idx, spec in enumerate(samplers):
-                write_ref = (spec_idx == 0)
+        for spec in samplers:
+            for task in spec.tasks:
+                write_ref = task not in refs_written
+                refs_written.add(task)
 
                 # Unconditional generation can't be CFG-guided
                 if task == 'joint' and spec.guidance_scale > 0.0:
@@ -556,11 +639,12 @@ def generate_textaudio(cfg, model, device, rank: int, world_size: int) -> Option
                     continue
 
                 _dbg(f"[{task}][{spec.tag}] generating (steps={spec.num_steps}) ...", all_ranks=True)
+                t0 = time.monotonic()
 
                 # ---------------------------------------------------------------
-                # salmon: 6 sub-tasks, variable-length prefixes, wav-only
+                # cont_salmon: 6 sub-tasks, variable-length prefixes, wav-only
                 # ---------------------------------------------------------------
-                if task == 'salmon':
+                if task == 'cont_salmon':
                     for salmon_task, rows in salmon_prompts.items():
                         my_idx = _shard_indices(len(rows), world_size, rank)
                         my_rows = [rows[i] for i in my_idx]
@@ -585,7 +669,7 @@ def generate_textaudio(cfg, model, device, rank: int, world_size: int) -> Option
                         gen_wavs = _decode_speech_wavs(
                             speech_tok, token_ids, text_seq_len, speaker_seq_len, speech_offset, speech_vocab_sz,
                         )
-                        task_dir = run_dir / spec.tag / 'salmon' / salmon_task
+                        task_dir = run_dir / spec.tag / 'cont_salmon' / salmon_task
                         task_dir.mkdir(parents=True, exist_ok=True)
                         samples = []
                         for i, w in enumerate(gen_wavs):
@@ -593,6 +677,9 @@ def generate_textaudio(cfg, model, device, rank: int, world_size: int) -> Option
                             _write_wav(task_dir / wav_name, w, sample_rate)
                             samples.append({'gen_wav': wav_name})
                         _write_samples(task_dir, samples)
+                    if _rank0():
+                        _update_tag_manifest(run_dir, spec.tag, task, _spec_to_dict(spec), shared_header)
+                    _dbg(f"[{task}][{spec.tag}] done in {time.monotonic() - t0:.1f}s", all_ranks=True)
                     continue
 
                 # ---------------------------------------------------------------
@@ -637,6 +724,10 @@ def generate_textaudio(cfg, model, device, rank: int, world_size: int) -> Option
                                 sample['ref_wav'] = f'stt_{p}/{ref_wav_name}'
                             samples.append(sample)
                         _write_samples(task_dir, samples)
+                        _update_tag_manifest(
+                            run_dir, spec.tag, task, _spec_to_dict(spec), shared_header, stt_partition=p,
+                        )
+                    _dbg(f"[{task}][{spec.tag}] done in {time.monotonic() - t0:.1f}s", all_ranks=True)
                     continue
 
                 # ---------------------------------------------------------------
@@ -682,12 +773,13 @@ def generate_textaudio(cfg, model, device, rank: int, world_size: int) -> Option
                         ref_gathered = _gather_bits(local_ref, sequence_len, device)
 
                 if not _rank0():
+                    _dbg(f"[{task}][{spec.tag}] done in {time.monotonic() - t0:.1f}s", all_ranks=True)
                     continue
 
                 gen_token_ids = _bits_to_token_ids(gen_gathered, bits_per_token)
                 gen_texts = (
                     _decode_texts(text_tok, gen_token_ids, text_seq_len, speech_offset, speech_vocab_sz)
-                    if task in ('joint', 'cont') else None
+                    if task in ('joint', 'cont_taste', 'cont_flowslm') else None
                 )
                 gen_wavs = _decode_speech_wavs(
                     speech_tok, gen_token_ids, text_seq_len, speaker_seq_len, speech_offset, speech_vocab_sz,
@@ -713,12 +805,15 @@ def generate_textaudio(cfg, model, device, rank: int, world_size: int) -> Option
                     sample['gen_wav'] = wav_name
 
                     if write_ref and task == 'tts' and tts_ref_cache and i < len(tts_ref_cache):
+                        ref_dir.mkdir(parents=True, exist_ok=True)
                         ref_wav_name = f'ref_{i:04d}.wav'
                         _write_wav(ref_dir / ref_wav_name, tts_ref_cache[i], sample_rate)
                         sample['ref_wav'] = f'{task}/{ref_wav_name}'
 
                     samples.append(sample)
                 _write_samples(task_dir, samples)
+                _update_tag_manifest(run_dir, spec.tag, task, _spec_to_dict(spec), shared_header)
+                _dbg(f"[{task}][{spec.tag}] done in {time.monotonic() - t0:.1f}s", all_ranks=True)
 
     barrier()
     if _rank0():

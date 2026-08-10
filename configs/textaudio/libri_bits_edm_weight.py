@@ -148,7 +148,7 @@ def get_config():
     cfg.train.entropy_num_bins = 128
     cfg.train.entropy_min_per_bin = 100
     cfg.train.entropy_update_every_steps = 2000
-    cfg.train.entropy_warmup_steps = 10_000 # TODO: back to 40_000 (check)
+    cfg.train.entropy_warmup_steps = 10_000
     cfg.train.entropy_transition_steps = 3_000
     cfg.train.entropy_gamma_max = 1.0
     cfg.train.entropy_mode = "regularized"

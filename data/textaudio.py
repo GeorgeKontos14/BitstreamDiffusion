@@ -40,9 +40,14 @@ def _build_token_to_bits_table(vocab_size: int, bits_per_token: int) -> torch.Te
     shifts = torch.arange(bits_per_token-1, -1, -1, dtype=torch.long)
     return (ids.unsqueeze(1) >> shifts) & 1
 
-def _val_test_geometry_suffix(config: config_dict.ConfigDict) -> str:
+def _val_geometry_suffix(config: config_dict.ConfigDict) -> str:
     seq_len_tokens = int(getattr(config.data, 'seq_len_tokens', 1000))
-    return '' if seq_len_tokens == 1000 else f'_{seq_len_tokens}'
+    return f'_{seq_len_tokens}'
+
+
+def _test_geometry_suffix(config: config_dict.ConfigDict) -> str:
+    seq_len_tokens = int(getattr(config.data, 'seq_len_tokens', 1000))
+    return f'_{seq_len_tokens}'
 
 
 def _ddp_is_on() -> bool:
@@ -179,12 +184,12 @@ class TextAudioDataset(_PackedTokenCacheDataset):
             cache_path = root / f'{stem}.uint32'
             meta_path = root / f'{stem}.meta.json'
         elif split == 'val':
-            stem = f'validation/cache_val_{self.TASK}{_val_test_geometry_suffix(config)}'
+            stem = f'validation/cache_val_{self.TASK}{_val_geometry_suffix(config)}'
             cache_path = root / f'{stem}.uint32'
             meta_path = root / f'{stem}.meta.json'
         else:
             test_partition = str(getattr(config.data, 'partition', 'clean'))
-            stem = f'test/cache_test_{test_partition}_{self.TASK}{_val_test_geometry_suffix(config)}'
+            stem = f'test/cache_test_{test_partition}_{self.TASK}{_test_geometry_suffix(config)}'
             cache_path = root / f'{stem}.uint32'
             meta_path = root / f'{stem}.meta.json'
 
@@ -211,10 +216,10 @@ class TextAudioTTSDataset(_PackedTokenCacheDataset):
         root = Path(getattr(config.data, 'root', 'datasets/'))
 
         if split == 'val':
-            stem = f'validation/cache_val_{self.TASK}{_val_test_geometry_suffix(config)}'
+            stem = f'validation/cache_val_{self.TASK}{_val_geometry_suffix(config)}'
         else:
             test_partition = str(getattr(config.data, 'partition', 'clean'))
-            stem = f'test/cache_test_{test_partition}_{self.TASK}{_val_test_geometry_suffix(config)}'
+            stem = f'test/cache_test_{test_partition}_{self.TASK}{_test_geometry_suffix(config)}'
 
         text_seq_len = int(getattr(config.data, 'text_seq_len', 168))
         speaker_seq_len = int(getattr(config.data, 'speaker_seq_len', 32))
@@ -233,14 +238,16 @@ class TextAudioTTSDataset(_PackedTokenCacheDataset):
 class TextAudioContinuationDataset(_PackedTokenCacheDataset):
     TASK = 'cont'
 
-    def __init__(self, config: config_dict.ConfigDict, *, split: str):
+    def __init__(self, config: config_dict.ConfigDict, *, split: str, cache_name: str | None = None):
         if split not in {'val', 'test'}:
             raise ValueError(
                 f"TextAudioContinuationDataset has no split={split!r}; only 'val'/'test' exist."
             )
         root = Path(getattr(config.data, 'root', 'datasets/'))
 
-        if split == 'val':
+        if cache_name is not None:
+            stem = f'test/{cache_name}'
+        elif split == 'val':
             stem = f'validation/cache_val_{self.TASK}'
         else:
             test_partition = str(getattr(config.data, 'partition', 'clean'))

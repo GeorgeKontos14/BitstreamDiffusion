@@ -1,11 +1,11 @@
-# configs/textaudio/libri_mls_large.py
+# configs/textaudio/mls_large.py
 #
 # MAIN scaled run: joint audio+text bitstream diffusion on LibriTTS+MLS (~11M pairs),
 # StableCodec speech tokens ("1x46656_400bps"), BiCodec speaker tokens, SDT large 26x1152 (~633M),
 # trained to 2M steps. The "serious, competitive, scaled" setup and the reference
 
 #
-# Geometry: [SOS][SOT] text(168) [EOT][SOSpk] speaker(32) [EOSpk][SOSpc] speech(800) [EOSpc]
+# Geometry: [SOS][SOT] text(100) [EOT][SOSpk] speaker(32) [EOSpk][SOSpc] speech(500) [EOSpc]
 #   = 1000 positions * 18 bits = 18000 bits. (truncates only 53 samples from LibriTTS; maintains full MLS)
 
 
@@ -21,7 +21,7 @@ def get_config():
     cfg = config_dict.ConfigDict()
 
     cfg.framework = "continuous_score"
-    cfg.experiment = "COBIT_630M_632"
+    cfg.experiment = "text_audio_joint"
     cfg.device = "cuda"
 
     # ------------------------------------------------------------------

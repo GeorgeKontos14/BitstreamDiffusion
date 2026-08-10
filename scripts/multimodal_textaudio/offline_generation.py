@@ -12,7 +12,6 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-# Every callback class Trainer.__init__ can construct, besides TextAudioCallback.
 _OTHER_CALLBACK_ATTRS = (
     "SigmaDataEstimator",
     "EntropySchedulePlotCallback",
@@ -58,6 +57,12 @@ def parse_args() -> argparse.Namespace:
              "sampler. Defaults to runs/<experiment>/ (whatever the live job most "
              "recently wrote there); pass a snapshot dir to pin an exact state.",
     )
+    p.add_argument(
+        "--tasks", nargs="+", default=None, choices=["joint", "tts", "stt", "cont"],
+        help="Restrict generation to these tasks only (default: all of "
+             "utils.callbacks.textaudio_generation.TASKS). Useful for quick, "
+             "targeted diagnostic runs.",
+    )
     return p.parse_args()
 
 
@@ -86,6 +91,8 @@ def main() -> None:
         _train_entry._update_cfg_from_dict(
             cfg, saved_cfg_dict, skip_sections=("logging", "system", "evaluation", "textaudio"),
         )
+        cfg.data.dataset = 'textaudio'
+        cfg.data.root = 'datasets/'
         print(f"[offline-gen] merged saved config from {saved_cfg_path} (kept this file's cfg.train.textaudio)")
 
     from ml_collections import config_dict
@@ -104,8 +111,6 @@ def main() -> None:
     cfg.train.textaudio.split = "val"  # exclusively the validation split
     cfg.train.textaudio.entropy_run_dir = args.entropy_run_dir or str(run_dir)
 
-    # ---- SAFETY: never let constructing Trainer touch the live run's files,
-    # ---- or construct any callback besides TextAudioCallback ----
     import trainers.trainer as _trainer_mod
 
     _orig_save_config = _trainer_mod._save_config_to_run_dir
@@ -114,6 +119,20 @@ def main() -> None:
     _orig_callback_classes = {name: getattr(_trainer_mod, name) for name in _OTHER_CALLBACK_ATTRS}
     for name in _OTHER_CALLBACK_ATTRS:
         setattr(_trainer_mod, name, _NoOpCallback)
+
+    import utils.callbacks.textaudio_generation as _textaudio_cb_mod
+    _orig_tasks = _textaudio_cb_mod.TASKS
+    if args.tasks:
+        _textaudio_cb_mod.TASKS = list(args.tasks)
+
+    _orig_get_dataloaders = _trainer_mod.get_dataloaders
+
+    def _val_only_get_dataloaders(cfg, **kwargs):
+        from data import get_loader
+        val_loader = get_loader(cfg, split='val', task='asr', batch_size=kwargs.get('batch_size'))
+        return val_loader, val_loader, val_loader
+
+    _trainer_mod.get_dataloaders = _val_only_get_dataloaders
 
     if getattr(cfg, "logging", None) is None:
         cfg.logging = config_dict.ConfigDict()
@@ -133,10 +152,10 @@ def main() -> None:
         trainer = Trainer(cfg)
     finally:
         _trainer_mod._save_config_to_run_dir = _orig_save_config
+        _trainer_mod.get_dataloaders = _orig_get_dataloaders
         for name, cls in _orig_callback_classes.items():
             setattr(_trainer_mod, name, cls)
 
-    # drop anything that isn't TextAudioCallback
     trainer.callbacks = [c for c in trainer.callbacks if isinstance(c, TextAudioCallback)]
 
     if trainer.resume_mode != "init_from":
@@ -159,7 +178,10 @@ def main() -> None:
     cb._should_run = lambda epoch, r: True  # force the run; bypass every_k_epochs gating
 
     save_dir = run_dir / "textaudio_offline" / f"step_{trainer.global_step:09d}" / args.eval_name
-    cb.on_epoch_end(trainer, epoch=0, save_dir_override=save_dir)
+    try:
+        cb.on_epoch_end(trainer, epoch=0, save_dir_override=save_dir)
+    finally:
+        _textaudio_cb_mod.TASKS = _orig_tasks
 
     print(f"[offline-gen] done. Results under: {save_dir}")
 
